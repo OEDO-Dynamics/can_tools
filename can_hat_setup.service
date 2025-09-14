@@ -4,7 +4,9 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/can_tools/enable_can_hat.sh
+ExecStart=/opt/can_tools/enable_canhat_fd.sh
+# If you want to use canhat+, uncomment the following line and comment the above line
+#ExecStart=/opt/can_tools/enable_canhat_plus.sh
 RemainAfterExit=yes
 
 [Install]

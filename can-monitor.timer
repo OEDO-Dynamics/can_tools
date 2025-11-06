@@ -1,0 +1,12 @@
+[Unit]
+Description=CAN Interface Monitor Timer
+Requires=can-monitor.service
+
+[Timer]
+# Run every 10 seconds
+OnBootSec=10s
+OnUnitActiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

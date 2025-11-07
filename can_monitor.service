@@ -4,10 +4,8 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/oedo/can-monitor.sh
-User=root
-StandardOutput=journal
-StandardError=journal
+ExecStart=/opt/can_tools/can_monitor.sh
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target

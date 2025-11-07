@@ -2,7 +2,7 @@
 # CAN Interface Monitor and Auto-Recovery Script
 # Monitors CAN interfaces for ERROR-PASSIVE or BUS-OFF state and resets them
 
-LOG_FILE="/var/log/can-monitor.log"
+LOG_FILE="/var/log/can_monitor.log"
 CAN_INTERFACES=("can0" "can1")
 
 # Function to log messages

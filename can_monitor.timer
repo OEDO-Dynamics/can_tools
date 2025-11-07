@@ -1,6 +1,6 @@
 [Unit]
 Description=CAN Interface Monitor Timer
-Requires=can-monitor.service
+Requires=can_monitor.service
 
 [Timer]
 # Run every 10 seconds

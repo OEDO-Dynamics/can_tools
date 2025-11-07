@@ -35,7 +35,7 @@ check_and_reset_can() {
         log_message "ALERT: $interface is in $can_state state - initiating reset"
 
         # Reset the interface
-        if ip link set "$interface" down && ip link set "$interface" up; then
+        if ip link set "$interface" down && sleep 0.5 && ip link set "$interface" up; then
             log_message "SUCCESS: $interface has been reset"
 
             # Wait a moment and check new state

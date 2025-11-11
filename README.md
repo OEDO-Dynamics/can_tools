@@ -19,12 +19,23 @@ sudo cp -rf can_tools /opt
 
 # Make systemctl service
 **CAUTION** The following code is only for **Raspberry Pi with CAN hat**.
+
+## CAN HAT FD
 ```bash
 cd <workspace>/can_tools
-sudo systemctl enable ./can_hat_setup.service
-sudo systemctl start can_hat_setup.service
+sudo systemctl enable ./canhat_fd_setup.service
+sudo systemctl start canhat_fd_setup.service
 # Then you can check whether the script works fine or not
-sudo systemctl status can_hat_setup.service
+sudo systemctl status canhat_fd_setup.service
+```
+
+## CAN HAT PLUS
+```bash
+cd <workspace>/can_tools
+sudo systemctl enable ./canhat_plus_setup.service
+sudo systemctl start canhat_plus_setup.service
+# Then you can check whether the script works fine or not
+sudo systemctl status canhat_plus_setup.service
 ```
 
 ## CAN Interface Setup

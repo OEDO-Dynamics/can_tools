@@ -1,0 +1,11 @@
+[Unit]
+Description=CAN Hat Setup Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/can_tools/enable_canhat_plus.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

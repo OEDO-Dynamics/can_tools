@@ -1,5 +1,5 @@
 [Unit]
-Description=CAN Hat Setup Service
+Description=CAN Hat Plus Setup Service
 After=network.target
 
 [Service]

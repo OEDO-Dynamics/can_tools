@@ -1,0 +1,10 @@
+[Unit]
+Description=CAN Interface Monitor and Auto-Recovery Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/can_tools/can_monitor.sh
+
+[Install]
+WantedBy=multi-user.target

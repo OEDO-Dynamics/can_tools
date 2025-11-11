@@ -20,11 +20,22 @@ sudo cp -rf can_tools /opt
 # Make systemctl service
 **CAUTION** The following code is only for **Raspberry Pi with CAN hat**.
 ```bash
-cd <workspace>/can_tools
+cd /opt/can_tools
 sudo systemctl enable ./can_hat_setup.service
 sudo systemctl start can_hat_setup.service
 # Then you can check whether the script works fine or not
 sudo systemctl status can_hat_setup.service
+```
+
+## CAN Monitor Service & Timer
+The monitor script (`can_monitor.sh`) checks CAN interfaces and is installed under `/opt/can_tools`. The timer unit triggers the oneshot service automatically—manual service runs are not required.
+```bash
+cd /opt/can_tools
+# Enable the 10-second timer (runs the service on schedule)
+sudo systemctl enable ./can_monitor.timer
+sudo systemctl start can_monitor.timer
+# Verify service runs via the timer
+sudo journalctl -u can_monitor.service -f
 ```
 
 ## CAN Interface Setup

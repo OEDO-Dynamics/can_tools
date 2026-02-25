@@ -21,7 +21,8 @@ check_and_reset_can() {
     fi
 
     # Get CAN state
-    local can_state=$(ip -details link show "$interface" | grep -oP 'can state \K[^ ]+')
+    # Pattern matches both "can state ERROR-ACTIVE" and "can <FLAGS> state ERROR-ACTIVE"
+    local can_state=$(ip -details link show "$interface" | grep -oP 'can\s+(<[^>]+>\s+)?state\s+\K[^ ]+')
 
     if [[ -z "$can_state" ]]; then
         log_message "WARNING: Could not determine state for $interface"
@@ -40,7 +41,7 @@ check_and_reset_can() {
 
             # Wait a moment and check new state
             sleep 1
-            local new_state=$(ip -details link show "$interface" | grep -oP 'can state \K[^ ]+')
+            local new_state=$(ip -details link show "$interface" | grep -oP 'can\s+(<[^>]+>\s+)?state\s+\K[^ ]+')
             log_message "INFO: $interface new state is $new_state"
         else
             log_message "ERROR: Failed to reset $interface"

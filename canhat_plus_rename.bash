@@ -15,7 +15,7 @@ done
 
 if [ -z "$CAN_SPI11" ] || [ -z "$CAN_SPI12" ]; then
     echo "ERROR: CAN interfaces for spi1.1/spi1.2 not found" >&2
-    return 1
+    return 0
 fi
 
 if [ "$CAN_SPI11" = "can0" ] && [ "$CAN_SPI12" = "can1" ]; then

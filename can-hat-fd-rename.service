@@ -1,0 +1,13 @@
+[Unit]
+Description=Rename 2-CH CAN HAT FD interfaces to match physical labels
+Wants=sys-subsystem-net-devices-can0.device sys-subsystem-net-devices-can1.device
+After=sys-subsystem-net-devices-can0.device sys-subsystem-net-devices-can1.device
+Before=canhat_fd_setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/can_tools/can-hat-fd-rename.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

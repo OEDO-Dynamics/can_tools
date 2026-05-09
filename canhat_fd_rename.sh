@@ -23,9 +23,9 @@ if [ "$CAN_SPI00" = "can0" ] && [ "$CAN_SPI10" = "can1" ]; then
     exit 0
 fi
 
-ip link set "$CAN_SPI00" down
-ip link set "$CAN_SPI10" down
-ip link set "$CAN_SPI10" name can_tmp
-ip link set "$CAN_SPI00" name can0
-ip link set can_tmp name can1
+sudo ip link set "$CAN_SPI00" down
+sudo ip link set "$CAN_SPI10" down
+sudo ip link set "$CAN_SPI10" name can_tmp
+sudo ip link set "$CAN_SPI00" name can0
+sudo ip link set can_tmp name can1
 echo "Renamed: spi0.0=${CAN_SPI00}->can0, spi1.0=${CAN_SPI10}->can1"

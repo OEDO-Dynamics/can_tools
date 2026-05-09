@@ -15,12 +15,12 @@ done
 
 if [ -z "$CAN_SPI11" ] || [ -z "$CAN_SPI12" ]; then
     echo "ERROR: CAN interfaces for spi1.1/spi1.2 not found" >&2
-    exit 1
+    return 1
 fi
 
 if [ "$CAN_SPI11" = "can0" ] && [ "$CAN_SPI12" = "can1" ]; then
     echo "CAN interfaces already correctly named"
-    exit 0
+    return 0
 fi
 
 sudo ip link set "$CAN_SPI11" down

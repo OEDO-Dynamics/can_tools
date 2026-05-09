@@ -6,7 +6,7 @@ Before=canhat_fd_setup.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/can_tools/can-hat-fd-rename.sh
+ExecStart=/opt/can_tools/canhat_fd_rename.sh
 RemainAfterExit=yes
 
 [Install]

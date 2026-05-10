@@ -6,7 +6,7 @@ Before=canhat_plus_setup.service
 
 [Service]
 Type=oneshot
-ExecStart=/opt/can_tools/enable_canhat_plus_rename.sh
+ExecStart=/opt/can_tools/canhat_plus_rename.bash
 RemainAfterExit=yes
 
 [Install]

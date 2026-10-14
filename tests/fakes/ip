@@ -1,190 +1,95 @@
 #!/bin/bash
 
 # tests/fakes/ip - Fake 'ip' command for testing
-# Logs all calls and responds based on sysfs state
 
 fake_dir="${CAN_TOOLS_FAKE_DIR:-.}"
 calls_log="$fake_dir/calls.log"
 
 # Log the call
-echo "$@" >> "$calls_log" 2>/dev/null || true
+echo "$@" >>"$calls_log" 2>/dev/null || true
 
 # Check if we should fail or hang
-if [[ -f "$fake_dir/fail/ip" ]]; then
-    exit 1
-fi
-
-if [[ -f "$fake_dir/hang/ip" ]]; then
-    # Hang indefinitely
-    while true; do
-        sleep 1
-    done
-fi
+[[ -f "$fake_dir/fail/ip" ]] && exit 1
+[[ -f "$fake_dir/hang/ip" ]] && { while true; do sleep 1; done; }
 
 # Parse arguments
 case "$1" in
     -d)
-        # "ip -d link show type can" - return iface state
         if [[ "$2" == "link" && "$3" == "show" && "$4" == "type" && "$5" == "can" ]]; then
-            # Output all CAN interfaces
             for iface_dir in "$fake_dir"/*/; do
                 [[ -d "$iface_dir" ]] || continue
                 iface=$(basename "$iface_dir")
+                [[ -f "$iface_dir/state" || -f "$iface_dir/config" ]] || continue
 
-                # Check if this looks like an iface dir (has state or config)
-                if [[ -f "$iface_dir/state" || -f "$iface_dir/config" ]]; then
-                    state_file="$iface_dir/state"
-                    config_file="$iface_dir/config"
+                admin="down"
+                grep -q "^admin=up$" "$iface_dir/config" 2>/dev/null && admin="up"
 
-                    # Determine admin status
-                    admin="down"
-                    if [[ -f "$config_file" ]] && grep -q "admin=up" "$config_file" 2>/dev/null; then
-                        admin="up"
-                    fi
+                flags="<NOARP"
+                [[ "$admin" == "up" ]] && flags="$flags,UP,LOWER_UP,ECHO"
+                flags="$flags> mtu 72 qdisc pfifo_fast state UP mode DEFAULT group default qlen 10"
 
-                    # First line: iface header with UP or similar
-                    flags="<NOARP"
-                    [[ "$admin" == "up" ]] && flags="$flags,UP"
-                    flags="$flags>"
-                    echo "1: $iface: $flags mtu 72"
+                index=$(($(basename "$iface" | sed 's/[^0-9]//g') + 2))
+                echo "$index: $iface: $flags"
 
-                    # Second line: CAN state line
-                    state=$(cat "$state_file" 2>/dev/null || echo "ERROR-ACTIVE")
+                state=$(cat "$iface_dir/state" 2>/dev/null || echo "ERROR-ACTIVE")
 
-                    # Build ctrlmode from config
-                    ctrlmode="<"
-                    [[ -f "$config_file" ]] && grep -q "berr=on" "$config_file" 2>/dev/null && ctrlmode="$ctrlmode""BERR-REPORTING,"
-                    [[ -f "$config_file" ]] && grep -q "fd=on" "$config_file" 2>/dev/null && ctrlmode="$ctrlmode""FD,"
-                    ctrlmode="$ctrlmode""TDC-AUTO>"
+                ctrlmode="<"
+                grep -q "^berr=on$" "$iface_dir/config" 2>/dev/null && ctrlmode="$ctrlmode""BERR-REPORTING,"
+                grep -q "^fd=on$" "$iface_dir/config" 2>/dev/null && ctrlmode="$ctrlmode""FD,"
+                ctrlmode="$ctrlmode""TDC-AUTO>"
 
-                    restart_ms=100
-                    if [[ -f "$config_file" ]]; then
-                        line=$(grep "restart_ms=" "$config_file" 2>/dev/null | head -1)
-                        [[ -n "$line" ]] && restart_ms="${line#*=}"
-                    fi
+                restart_ms=$(grep "^restart_ms=" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "100")
 
-                    echo "    can $ctrlmode state $state (berr-counter tx 0 rx 0) restart-ms $restart_ms"
-                fi
+                echo "    can $ctrlmode state $state (berr-counter tx 0 rx 0) restart-ms $restart_ms"
             done
         fi
         exit 0
         ;;
-
     "link")
-        # "ip link show <if>" or "ip link set ..." variants
         case "$2" in
-            show)
-                # Check if iface exists
-                if [[ -n "$3" ]]; then
-                    if [[ -d "$fake_dir/$3" ]]; then
-                        echo "1: $3: <NOARP> mtu 72"
-                        exit 0
-                    else
-                        exit 1
-                    fi
-                fi
+            "show")
+                [[ -n "$3" && -d "$fake_dir/$3" ]] && { echo "1: $3: <NOARP> mtu 72"; exit 0; }
+                exit 1
                 ;;
-            set)
-                # "ip link set <if> ..." - various operations
-                local if="$3"
-                local op="$4"
-
-                if [[ ! -d "$fake_dir/$if" ]]; then
-                    exit 1
-                fi
+            "set")
+                if_name="$3"
+                op="$4"
+                [[ -d "$fake_dir/$if_name" ]] || exit 1
 
                 case "$op" in
                     "down")
-                        # Update config: admin=down
-                        mkdir -p "$fake_dir/$if"
-                        if [[ -f "$fake_dir/$if/config" ]]; then
-                            sed -i 's/admin=.*/admin=down/' "$fake_dir/$if/config" 2>/dev/null || \
-                            echo "admin=down" >> "$fake_dir/$if/config"
-                        else
-                            echo "admin=down" > "$fake_dir/$if/config"
-                        fi
+                        mkdir -p "$fake_dir/$if_name"
+                        sed -i 's/^admin=.*/admin=down/' "$fake_dir/$if_name/config" 2>/dev/null || echo "admin=down" >"$fake_dir/$if_name/config"
                         exit 0
                         ;;
                     "up")
-                        # Update config: admin=up, and process type can parameters
-                        mkdir -p "$fake_dir/$if"
-
-                        # Parse parameters: type can bitrate ... restart-ms ... berr-reporting ... fd ...
-                        shift 4  # Skip "link set <if> up"
-
-                        local bitrate restart_ms berr fd
+                        mkdir -p "$fake_dir/$if_name"
+                        shift 4
+                        restart_ms="" berr="off" fd="off"
                         while [[ $# -gt 0 ]]; do
                             case "$1" in
-                                type) shift; shift;;  # skip "can"
-                                bitrate) shift; shift;;
-                                restart-ms)
-                                    restart_ms="$2"
-                                    shift 2
-                                    ;;
-                                berr-reporting)
-                                    shift
-                                    if [[ "$1" == "on" ]]; then
-                                        berr="on"
-                                    else
-                                        berr="off"
-                                    fi
-                                    shift
-                                    ;;
-                                dbitrate)
-                                    shift 2
-                                    ;;
-                                fd)
-                                    shift
-                                    if [[ "$1" == "on" ]]; then
-                                        fd="on"
-                                    else
-                                        fd="off"
-                                    fi
-                                    shift
-                                    ;;
-                                *)
-                                    shift
-                                    ;;
+                                type) shift 2;;
+                                bitrate|dbitrate) shift 2;;
+                                restart-ms) restart_ms="$2"; shift 2;;
+                                berr-reporting) berr="$2"; shift 2;;
+                                fd) fd="$2"; shift 2;;
+                                *) shift;;
                             esac
                         done
-
-                        # Write config
-                        {
-                            echo "admin=up"
-                            [[ -n "$restart_ms" ]] && echo "restart_ms=$restart_ms" || echo "restart_ms=100"
-                            [[ -n "$berr" ]] && echo "berr=$berr" || echo "berr=off"
-                            [[ -n "$fd" ]] && echo "fd=$fd" || echo "fd=on"
-                        } > "$fake_dir/$if/config"
-
+                        { echo "admin=up"; echo "restart_ms=${restart_ms:-100}"; echo "berr=$berr"; echo "fd=$fd"; } >"$fake_dir/$if_name/config"
                         exit 0
                         ;;
                     "name")
-                        # "ip link set <if> name <newname>"
-                        local newname="$5"
-                        if [[ -n "$newname" && "$if" != "$newname" ]]; then
-                            # Check if newname already in use (exists as dir)
-                            if [[ -d "$fake_dir/$newname" ]]; then
-                                exit 1  # Name in use
-                            fi
-                            # Rename
-                            mv "$fake_dir/$if" "$fake_dir/$newname" 2>/dev/null || exit 1
-                        fi
+                        newname="$5"
+                        [[ -n "$newname" && "$if_name" != "$newname" ]] && { [[ -d "$fake_dir/$newname" ]] && exit 1; mv "$fake_dir/$if_name" "$fake_dir/$newname" 2>/dev/null || exit 1; }
                         exit 0
                         ;;
                     "txqueuelen")
-                        # "ip link set <if> txqueuelen <val>"
-                        # Just acknowledge it
                         exit 0
-                        ;;
-                    *)
-                        exit 1
                         ;;
                 esac
                 ;;
         esac
         ;;
-
-    *)
-        exit 1
-        ;;
 esac
+exit 1

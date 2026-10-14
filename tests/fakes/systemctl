@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# tests/fakes/systemctl - Fake systemctl for testing
+
+fake_dir="${CAN_TOOLS_FAKE_DIR:-.}"
+
+echo "$@" >> "$fake_dir/calls.log" 2>/dev/null || true
+exit 0

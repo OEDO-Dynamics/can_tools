@@ -21,8 +21,19 @@ case "$1" in
                 iface=$(basename "$iface_dir")
                 [[ -f "$iface_dir/state" || -f "$iface_dir/config" ]] || continue
 
+                # N-M3: Support both 1-line and 4-line config formats
                 admin="down"
-                grep -q "^admin=up$" "$iface_dir/config" 2>/dev/null && admin="up"
+                berr="off"
+                fd="off"
+                restart_ms="100"
+
+                if [[ -f "$iface_dir/config" ]]; then
+                    # Read config: can be 1-line format or multi-line format
+                    admin=$(grep -o "admin=[a-z]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "down")
+                    berr=$(grep -o "berr=[a-z]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "off")
+                    fd=$(grep -o "fd=[a-z]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "off")
+                    restart_ms=$(grep -o "restart_ms=[0-9]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "100")
+                fi
 
                 flags="<NOARP"
                 [[ "$admin" == "up" ]] && flags="$flags,UP,LOWER_UP,ECHO"
@@ -34,11 +45,9 @@ case "$1" in
                 state=$(cat "$iface_dir/state" 2>/dev/null || echo "ERROR-ACTIVE")
 
                 ctrlmode="<"
-                grep -q "^berr=on$" "$iface_dir/config" 2>/dev/null && ctrlmode="$ctrlmode""BERR-REPORTING,"
-                grep -q "^fd=on$" "$iface_dir/config" 2>/dev/null && ctrlmode="$ctrlmode""FD,"
+                [[ "$berr" == "on" ]] && ctrlmode="$ctrlmode""BERR-REPORTING,"
+                [[ "$fd" == "on" ]] && ctrlmode="$ctrlmode""FD,"
                 ctrlmode="$ctrlmode""TDC-AUTO>"
-
-                restart_ms=$(grep "^restart_ms=" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "100")
 
                 echo "    can $ctrlmode state $state (berr-counter tx 0 rx 0) restart-ms $restart_ms"
             done
@@ -48,7 +57,11 @@ case "$1" in
     "link")
         case "$2" in
             "show")
-                [[ -n "$3" && -d "$fake_dir/$3" ]] && { echo "1: $3: <NOARP> mtu 72"; exit 0; }
+                # N-M3: Check for state file or config file to indicate iface exists
+                if [[ -n "$3" && ( -d "$fake_dir/$3" || -f "$fake_dir/$3/state" || -f "$fake_dir/$3/config" ) ]]; then
+                    echo "1: $3: <NOARP> mtu 72"
+                    exit 0
+                fi
                 exit 1
                 ;;
             "set")
@@ -76,7 +89,8 @@ case "$1" in
                                 *) shift;;
                             esac
                         done
-                        { echo "admin=up"; echo "restart_ms=${restart_ms:-100}"; echo "berr=$berr"; echo "fd=$fd"; } >"$fake_dir/$if_name/config"
+                        # N-M3: Write 1-line format config
+                        echo "restart_ms=${restart_ms:-100} berr=$berr fd=$fd admin=up" >"$fake_dir/$if_name/config"
                         exit 0
                         ;;
                     "name")

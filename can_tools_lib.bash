@@ -68,6 +68,30 @@ _can_set_defaults() {
     CAN_TXQUEUELEN=10
     CAN_DEPENDENT_UNITS=""
     CAN_FLUSH_IFACES="can0"
+    # WD_* reset to defaults (N-M2)
+    WD_LOOP_S=1
+    WD_STALE_TX_FLUSH_S=2
+    WD_FLUSH_BACKOFF_MAX_S=30
+    WD_SETTLE_SAMPLE_MS=100
+    WD_SETTLE_MAX_MS=2000
+    WD_BUSOFF_QUIET_S=10
+    WD_BUSOFF_BACKOFF_MAX_S=30
+    WD_STORM_COUNT=5
+    WD_STORM_WINDOW_S=60
+    WD_STALL_CONSEC=3
+    WD_STALL_POST_BUSOFF_CONSEC=2
+    WD_STALL_POST_BUSOFF_WINDOW_S=5
+    WD_STALL_VERIFY_S=10
+    WD_RTNL_TIMEOUT_S=5
+    WD_REBIND_TIMEOUT_S=10
+    WD_REBIND_MAX_PER_HOUR=3
+    WD_RTNL_HUNG_CONSEC=3
+    WD_PAUSE_DEFAULT_MIN=30
+    WD_PAUSE_WARN_S=600
+    WD_DEGRADED_CRIT_S=600
+    WD_LOG_SUMMARY_S=60
+    WD_LOG_RATE_S=10
+    WD_CRASH_KEEP=5
 }
 
 # Validate configuration value
@@ -99,6 +123,7 @@ _can_validate_value() {
 
 # Configuration Reading (§2b)
 # can_read_conf [path]
+# N-M2: Validate name keys for character types
 can_read_conf() {
     local conf_path="${1:-${CAN_TOOLS_CONF:-/opt/can_tools/can_tools.conf}}"
 
@@ -136,6 +161,35 @@ can_read_conf() {
     fi
 
     return 0
+}
+
+# Validate name configuration keys for character types (N-M2)
+_can_validate_names() {
+    local key="$1" val="$2"
+
+    case "$key" in
+        CAN_IFACES|CAN_FLUSH_IFACES)
+            # Interface names: alphanumeric, -, _ only
+            if [[ "$val" =~ ^([a-zA-Z0-9_-]+[[:space:]]*)*$ ]]; then
+                echo "$val"
+            else
+                can_log 4 "WARNING: Invalid interface name in $key: $val"
+                return 1
+            fi
+            ;;
+        CAN_SPI_MAP|CAN_DEPENDENT_UNITS)
+            # Space-separated pairs/entries, alphanumeric and basic punctuation
+            if [[ "$val" =~ ^([a-zA-Z0-9_.:/-]+[[:space:]]*)*$ ]]; then
+                echo "$val"
+            else
+                can_log 4 "WARNING: Invalid value in $key: $val"
+                return 1
+            fi
+            ;;
+        *)
+            echo "$val"
+            ;;
+    esac
 }
 
 # Locking (§2b)
@@ -179,6 +233,7 @@ can_unlock() {
 # Process Execution (§2b)
 # can_run_bounded <timeout_s> <cmd...>
 # Child runs with fd 9 closed. Output to temp file. PID preserved in parent.
+# N-H1: Disconnect child's stdio from parent to avoid blocking $( ) calls
 can_run_bounded() {
     local timeout="$1"
     shift
@@ -194,11 +249,12 @@ can_run_bounded() {
     outfile="${CAN_TOOLS_RUN_DIR:-/run/can_tools}/bounded_$$.tmp"
     mkdir -p "${CAN_TOOLS_RUN_DIR:-/run/can_tools}" 2>/dev/null || true
 
-    # Run in background with fd 9 closed, output to file
+    # Run in background with fd 9 closed, output to file, stdio disconnected (N-H1)
     (
         exec 9>&-
-        "${cmd[@]}" >"$outfile" 2>&1
-    ) &
+        exec >"$outfile" 2>&1
+        "${cmd[@]}"
+    ) </dev/null 2>&1 &
 
     CAN_RUN_BOUNDED_PID=$!
 
@@ -228,36 +284,14 @@ can_run_bounded() {
 
 # CAN Interface State Reading (§2b)
 # can_iface_states
-# Call can_run_bounded in current shell, read temp file (C2)
+# Call can_run_bounded once, parse stdout (N-H1: read from stdout directly)
 can_iface_states() {
     # Define regexes as variables
     local re_iface='^[0-9]+: ([^:@]+)[:@] ([^[:space:]]*)'
     local re_can='^[[:space:]]+can ([^s]*)state ([A-Z-]+)'
     local re_restart='restart-ms ([0-9]+)'
 
-    # Run ip command (in current shell for PID tracking)
-    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" \
-        "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can >/dev/null 2>&1
-    local ret=$?
-
-    if [[ $ret -eq 124 ]]; then
-        return 124
-    fi
-
-    # Create temp file
-    local tmpout="${CAN_TOOLS_RUN_DIR:-/run/can_tools}/iface_states_$$.tmp"
-
-    # Re-run to capture output
-    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" \
-        "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can >"$tmpout" 2>&1
-    ret=$?
-
-    if [[ $ret -eq 124 ]]; then
-        rm -f "$tmpout"
-        return 124
-    fi
-
-    # Parse the output
+    # Parse the output from can_run_bounded stdout (N-H1: 1 call only, pipe directly)
     local if_name if_state if_admin restart_ms berr fd ctrlmode
     local found=0
 
@@ -290,9 +324,9 @@ can_iface_states() {
             echo "$if_name $if_state restart_ms=$restart_ms berr=$berr fd=$fd admin=$if_admin"
             (( found++ ))
         fi
-    done <"$tmpout"
+    done < <(can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" \
+        "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can 2>&1)
 
-    rm -f "$tmpout"
     [[ $found -eq 0 ]] && return 1
     return 0
 }
@@ -350,7 +384,7 @@ can_iface_of_spidev() {
 
 # Interface Naming (§2b)
 # can_pin_name <spidev> <want>
-# Returns 0 if ok/renamed, 2 if name in use, 1 if error
+# Returns 0 if ok/renamed, 2 if name in use (EEXIST), 1 if error
 can_pin_name() {
     local spidev="$1"
     local want="$2"
@@ -369,10 +403,22 @@ can_pin_name() {
     [[ "$current" == "$want" ]] && return 0
 
     if [[ -n "$want" ]]; then
-        # Check if want name is in use (M1: use bounded)
+        # Check if want name is in use (N-C1: split rc branches)
         can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link show "$want" >/dev/null 2>&1
-        if [[ $? -ne 124 ]]; then  # Command succeeded (name exists)
+        local check_rc=$?
+
+        if [[ $check_rc -eq 0 ]]; then
+            # Name exists (already in use) - name collision
             return 2
+        elif [[ $check_rc -eq 1 ]]; then
+            # Name doesn't exist, continue to rename
+            :
+        elif [[ $check_rc -eq 124 ]]; then
+            # Timeout/bounded abort
+            return 1
+        else
+            # Other error
+            return 1
         fi
 
         # Down first (M1)
@@ -380,7 +426,10 @@ can_pin_name() {
 
         # Rename (M1: use bounded)
         can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$current" name "$want" >/dev/null 2>&1
-        if [[ $? -ne 124 ]]; then
+        local rename_rc=$?
+
+        # N-C1: Only return 0 if rename succeeded (rc==0)
+        if [[ $rename_rc -eq 0 ]]; then
             return 0
         else
             return 1
@@ -392,6 +441,7 @@ can_pin_name() {
 
 # Interface Setup (§2b)
 # can_setup_iface <if>
+# N-H2: Always explicitly include fd on/off and berr-reporting on/off
 can_setup_iface() {
     local if="$1"
     local ip_cmd="${CAN_TOOLS_IP_CMD:-ip}"
@@ -407,23 +457,28 @@ can_setup_iface() {
     can_lock 5 || return 1
 
     if [[ -n "$dry_run" ]]; then
-        # H1: Log the full command
-        local fd_args="" berr_args=""
-        [[ "$fd" == "on" ]] && fd_args="dbitrate $dbitrate fd on"
-        [[ "$berr" == "on" ]] && berr_args="berr-reporting on" || berr_args="berr-reporting off"
+        # H1: Log the full command (N-H2: always include fd and berr)
+        local fd_args="fd $fd"
+        [[ "$fd" == "on" ]] && fd_args="dbitrate $dbitrate fd on" || fd_args="fd off"
+        local berr_args="berr-reporting $berr"
+        can_log 6 "DRY_RUN: $ip_cmd link set $if down"
         can_log 6 "DRY_RUN: $ip_cmd link set $if up type can bitrate $bitrate restart-ms $restart_ms $berr_args $fd_args"
         can_log 6 "DRY_RUN: $ip_cmd link set $if txqueuelen $txqueuelen"
         can_unlock
         return 0
     fi
 
-    # Down
+    # Down (L-2: log it)
     can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$if" down >/dev/null 2>&1
 
-    # Build parameters (H2: always specify berr and fd)
+    # Build parameters (N-H2: always specify berr and fd)
     local berr_args="berr-reporting $berr"
     local fd_args=""
-    [[ "$fd" == "on" ]] && fd_args="dbitrate $dbitrate fd on"
+    if [[ "$fd" == "on" ]]; then
+        fd_args="dbitrate $dbitrate fd on"
+    else
+        fd_args="fd off"
+    fi
 
     # Up with parameters
     if ! can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$if" up \
@@ -493,12 +548,16 @@ can_pause_active() {
 
 # Logging (§2b)
 # can_log <prio> <key=value...>
+# N-M1: Map priority names to numbers (case-insensitive), handle either
 can_log() {
     local prio="$1"
     shift
     local log_file="${CAN_TOOLS_LOG_FILE:-}"
 
-    # M2: Map priority names to numbers, handle either
+    # Normalize to lowercase for case-insensitive matching
+    prio="${prio,,}"
+
+    # Map priority names to numbers
     case "$prio" in
         emerg) prio=0 ;;
         alert) prio=1 ;;
@@ -512,7 +571,7 @@ can_log() {
     esac
 
     local prefix="$((prio))"
-    # M2: Use $* not $@
+    # Use $* not $@
     local msg="$*"
 
     echo "<$prefix>can_tools[$$]: $msg" >&2

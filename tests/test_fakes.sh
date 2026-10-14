@@ -45,14 +45,14 @@ else
     echo "FAIL: fake ip link set can0 up type can ... should succeed (C3 bug check)"
 fi
 
-if grep -q "^berr=on$" "$tmpdir/can0/config"; then
+if grep -q "berr=on" "$tmpdir/can0/config"; then
     pass=$((pass+1))
 else
     fail=$((fail+1))
     echo "FAIL: fake ip should write berr=on to config"
 fi
 
-if grep -q "^fd=on$" "$tmpdir/can0/config"; then
+if grep -q "fd=on" "$tmpdir/can0/config"; then
     pass=$((pass+1))
 else
     fail=$((fail+1))

@@ -6,16 +6,16 @@ passed=0 failed=0
 
 for test_file in test_*.sh; do
     [[ -f "$test_file" ]] || continue
-    
+
     echo "Running: $test_file"
     bash "$test_file"
     ret=$?
-    
+
     if (( ret == 0 )); then
-        (( passed++ ))
+        passed=$((passed+1))
         echo "  PASSED"
     else
-        (( failed++ ))
+        failed=$((failed+1))
         echo "  FAILED"
     fi
 done

@@ -1,0 +1,15 @@
+[Unit]
+Description=Resident CAN interface watchdog (bus-off / rx-offload stall recovery)
+Wants=canhat_fd_setup.service
+After=canhat_fd_setup.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/can_tools/can_watchdog.sh
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

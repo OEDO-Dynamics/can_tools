@@ -21,9 +21,13 @@
 # CAN_IFACES=can0 can1
 # CAN_SPI_MAP=spi0.0:can0 spi1.0:can1
 # CAN_BITRATE=250000
-# CAN_RESTART_MS=100
+# CAN_RESTART_MS=0
+#   WARNING: Do NOT set CAN_RESTART_MS to a value other than 0. The kernel's
+#   automatic bus-off restart (via echo_skb, see raspberrypi/linux#6916) will
+#   race with can_watchdog's recovery logic, leading to unpredictable behavior.
+#   The watchdog owns bus-off recovery; leave this at 0.
 # CAN_BERR_REPORTING=off
-# CAN_FD=on
+# CAN_FD=off
 # CAN_DBITRATE=2000000
 # CAN_TXQUEUELEN=10
 

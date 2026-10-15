@@ -65,7 +65,8 @@ sudo nano /opt/can_tools/can_tools.conf
 - `CAN_IFACES` - Space-separated interface names (default: `can0 can1`)
 - `CAN_SPI_MAP` - SPI device to interface name mapping (default: `spi0.0:can0 spi1.0:can1`)
 - `CAN_BITRATE` - Bitrate in bps (default: `250000`)
-- `CAN_FD` - Enable CAN FD (default: `on`)
+- `CAN_FD` - Enable CAN FD (default: `off` - the edge apps don't use FD; see Issue #9 論点 C)
+- `CAN_RESTART_MS` - kernel auto-restart on bus-off, in ms, `0` disables it (default: `0` - the resident watchdog (`can_watchdog.service`) owns bus-off recovery instead; see Issue #9)
 - `CAN_TXQUEUELEN` - TX queue length (default: `10`)
 
 For full option details, see `/opt/can_tools/can_tools.conf.example`.

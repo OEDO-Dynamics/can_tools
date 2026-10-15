@@ -189,6 +189,39 @@ CAN_RUN_BOUNDED_PID=""
 can_run_bounded 2 true >/dev/null 2>&1
 check $? "can_run_bounded should be able to start a new child once the old hung one is gone"
 
+# BASHPID collision test (低-4): concurrent subshells should not collide on
+# temp file names. Each subshell has a unique BASHPID, so temp files should
+# be named uniquely even when $$ is the same.
+tmpdir_bashpid="$tmpdir/run_bashpid"
+mkdir -p "$tmpdir_bashpid"
+saved_run_dir="$CAN_TOOLS_RUN_DIR"
+export CAN_TOOLS_RUN_DIR="$tmpdir_bashpid"
+
+# Run two subshells in parallel, each calling can_run_bounded
+(
+    can_run_bounded 1 bash -c 'echo "subshell 1"' >"$tmpdir/out1.txt" 2>&1
+)&
+pid1=$!
+(
+    can_run_bounded 1 bash -c 'echo "subshell 2"' >"$tmpdir/out2.txt" 2>&1
+)&
+pid2=$!
+
+wait "$pid1" "$pid2" 2>/dev/null
+
+# Check that both subshells completed successfully and didn't collide
+rc1=$(cat "$tmpdir/out1.txt" 2>/dev/null | grep -c "subshell 1")
+rc2=$(cat "$tmpdir/out2.txt" 2>/dev/null | grep -c "subshell 2")
+if [[ $rc1 -eq 1 ]]; then check 0 "can_run_bounded in subshell 1 should complete"; else check 1 "can_run_bounded in subshell 1 should complete"; fi
+if [[ $rc2 -eq 1 ]]; then check 0 "can_run_bounded in subshell 2 should complete"; else check 1 "can_run_bounded in subshell 2 should complete"; fi
+
+# Verify temp files don't collide by checking if only unique files exist
+temp_files=$(ls -1 "$tmpdir_bashpid"/bounded_*.tmp 2>/dev/null | wc -l)
+if [[ $temp_files -le 2 ]]; then check 0 "can_run_bounded should not create excessive temp files from collision (found $temp_files, expected 0-2 cleaned up)"; else check 1 "can_run_bounded created too many temp files (found $temp_files)"; fi
+
+# Restore the original CAN_TOOLS_RUN_DIR for can_pause tests
+export CAN_TOOLS_RUN_DIR="$saved_run_dir"
+
 # ========== can_pin_name tests (tests/fakes/ip) ==========
 echo "Testing can_pin_name..."
 

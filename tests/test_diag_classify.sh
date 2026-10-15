@@ -1,8 +1,15 @@
 #!/bin/bash
 
-# Test can_diag.sh error frame classification logic
+# Test can_diag.sh error frame classification (Issue #9 review C1-C4):
+#   - the candump -L line regex actually matches and parses (C1)
+#   - the format matches real `candump -L -e any,0~0,#FFFFFFFF` output (C2)
+#   - classification follows linux/can/error.h bit-for-bit, counting every
+#     set bit independently rather than overwriting with "last one wins" (C3)
+#   - the test checks exact per-category COUNTS, not just that section
+#     headings exist (C4)
+# Also covers M5 (sysfs stats come from CAN_TOOLS_SYSFS_ROOT via the lib's
+# can_read_stats(), not a hardcoded /sys/class/net path).
 
-# Setup
 tmpdir=$(mktemp -d)
 # shellcheck disable=SC2064
 trap "rm -rf '$tmpdir'" EXIT
@@ -18,7 +25,6 @@ check() {
     fi
 }
 
-# Set up test environment
 export CAN_TOOLS_RUN_DIR="$tmpdir/run"
 export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
 
@@ -31,19 +37,18 @@ export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
 
 mkdir -p "$tmpdir/run" "$tmpdir/fake" "$tmpdir/fake/can0" "$tmpdir/fake/can1"
 
-# Initialize fake interfaces
 echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
 echo "restart_ms=100 berr=off fd=off admin=up" >"$tmpdir/fake/can0/config"
 echo "ERROR-ACTIVE" >"$tmpdir/fake/can1/state"
 echo "restart_ms=100 berr=off fd=off admin=up" >"$tmpdir/fake/can1/config"
 
-# Initialize sysfs
 mkdir -p "$tmpdir/sys/class/net/can0/statistics"
 mkdir -p "$tmpdir/sys/class/net/can1/statistics"
-echo "100" >"$tmpdir/sys/class/net/can0/statistics/rx_packets"
+echo "123" >"$tmpdir/sys/class/net/can0/statistics/rx_packets"
 echo "50" >"$tmpdir/sys/class/net/can0/statistics/tx_packets"
-echo "0" >"$tmpdir/sys/class/net/can0/statistics/rx_fifo_errors"
+echo "7" >"$tmpdir/sys/class/net/can0/statistics/rx_fifo_errors"
 echo "0" >"$tmpdir/sys/class/net/can0/statistics/tx_fifo_errors"
+echo "1" >"$tmpdir/sys/class/net/can0/ifindex"
 echo "100" >"$tmpdir/sys/class/net/can1/statistics/rx_packets"
 echo "0" >"$tmpdir/sys/class/net/can1/statistics/tx_packets"
 echo "0" >"$tmpdir/sys/class/net/can1/statistics/rx_fifo_errors"
@@ -51,27 +56,16 @@ echo "0" >"$tmpdir/sys/class/net/can1/statistics/tx_fifo_errors"
 
 export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
 export CAN_TOOLS_FAKE_TIME_FILE="$tmpdir/time"
+echo "1700000000" >"$CAN_TOOLS_FAKE_TIME_FILE"
 
 echo "Testing can_diag.sh classification logic..."
 
-# Test 1: Run can_diag.sh with fake commands
 cd "$(dirname "$0")/.." || exit 1
-
-# Debug: check that CAN_TOOLS_CANDUMP_CMD is set correctly
-if [[ -n "${CAN_TOOLS_CANDUMP_CMD:-}" ]]; then
-    echo "DEBUG: CAN_TOOLS_CANDUMP_CMD=$CAN_TOOLS_CANDUMP_CMD"
-    if ! [[ -x "$CAN_TOOLS_CANDUMP_CMD" ]]; then
-        echo "ERROR: CAN_TOOLS_CANDUMP_CMD is not executable: $CAN_TOOLS_CANDUMP_CMD"
-        exit 1
-    fi
-fi
 
 output=$(bash can_diag.sh 3 2>&1)
 rc=$?
+check "$rc" "can_diag.sh should exit 0 (got rc=$rc); output follows:\n$output"
 
-check "$rc" "can_diag.sh should exit 0"
-
-# Verify output file was created
 diag_file=$(echo "$output" | grep "Diagnostics saved" | awk '{print $NF}')
 if [[ -n "$diag_file" && -f "$diag_file" ]]; then
     check 0 "can_diag.sh should create output file"
@@ -80,47 +74,72 @@ else
 fi
 
 if [[ -f "$diag_file" ]]; then
-    # Debug: show full candump section
-    echo "DEBUG: Full diag file:"
-    tail -50 "$diag_file" >&2
+    echo "DEBUG: Full diag file:" >&2
+    cat "$diag_file" >&2
 
-    # Check output contains expected sections
-    grep -q "IP Link Show" "$diag_file"
-    ip_show=$?
-    check "$ip_show" "Output should contain IP link show section"
+    for section in "IP Link Show" "sysfs Statistics" "kernel log" "CAN Error Frames" "Error Frame Summary" "Interface Setup"; do
+        grep -q "$section" "$diag_file"
+        check $? "Output should contain '$section' section"
+    done
 
-    grep -q "sysfs Statistics" "$diag_file"
-    sysfs_stats=$?
-    check "$sysfs_stats" "Output should contain sysfs statistics section"
+    # --- C1/C2: the regex actually matched real -L lines; raw matched error
+    # frame lines (not the one ordinary data frame) must be echoed verbatim.
+    grep -q '^(1697000000\.000002) can0 20000020#0000000000000000$' "$diag_file"
+    check $? "raw -L error-frame line should be preserved verbatim (C1/C2)"
 
-    grep -q "kernel log" "$diag_file"
-    kernel_log=$?
-    check "$kernel_log" "Output should contain kernel log section"
+    # the ordinary (non-error) data frame must not be written to the diag
+    # file at all: diag_classify_line() rejects it (no CAN_ERR_FLAG) before
+    # it would ever be echoed.
+    if grep -qF '18DA31F9' "$diag_file"; then
+        check 1 "ordinary (non-error) frame must not appear in the diag file"
+    else
+        check 0 "ordinary (non-error) frame must not appear in the diag file"
+    fi
 
-    grep -q "CAN Error Frames" "$diag_file"
-    error_frames=$?
-    check "$error_frames" "Output should contain error frames section"
+    # --- C3/C4: exact expected counts per category, from the fake's own
+    # documented scenario (tests/diag_fakes/candump).
+    declare -A expected=(
+        ["can0 class=ACK count=1"]=1
+        ["can0 class=BUSOFF count=1"]=1
+        ["can0 class=PROT count=2"]=1
+        ["can0 class=BUSERROR count=1"]=1
+        ["can0 class=CRTL count=1"]=1
+        ["can0 prot=TX count=1"]=1
+        ["can0 loc=ACK count=1"]=1
+        ["can0 prot=FORM count=1"]=1
+        ["can0 ctrl=RX_WARNING count=1"]=1
+        ["can1 class=TRX count=1"]=1
+        ["can1 trx=CANH_SHORT_TO_GND count=1"]=1
+    )
+    for want in "${!expected[@]}"; do
+        grep -qF "$want" "$diag_file"
+        check $? "Error Frame Summary should contain exact count: '$want'"
+    done
 
-    grep -q "Error Frame Summary" "$diag_file"
-    error_summary=$?
-    check "$error_summary" "Output should contain error summary section"
+    # A key that must NOT appear (sanity: no spurious class=ACK on can1, no
+    # bit0 misfire on the FORM-only frame).
+    if grep -qF "can1 class=ACK" "$diag_file"; then
+        check 1 "must not classify can1 as ACK (no such frame in the scenario)"
+    else
+        check 0 "must not classify can1 as ACK (no such frame in the scenario)"
+    fi
 
-    # Verify candump section exists (even if empty in test env)
-    grep -q "CAN Error Frames" "$diag_file"
-    candump_section=$?
-    check "$candump_section" "Output should contain CAN Error Frames section"
+    # --- M5: sysfs values came from CAN_TOOLS_SYSFS_ROOT (can_read_stats),
+    # not a hardcoded /sys/class/net path - check the actual fixture values.
+    grep -q "rx_packets: 123" "$diag_file"
+    check $? "sysfs rx_packets should reflect CAN_TOOLS_SYSFS_ROOT fixture (M5)"
+    grep -q "rx_fifo_errors: 7" "$diag_file"
+    check $? "sysfs rx_fifo_errors should reflect CAN_TOOLS_SYSFS_ROOT fixture (M5)"
 fi
 
-# Test 2: Verify berr-reporting was restored
-final_berr=$(cat "$tmpdir/fake/can0/config" | grep -o "berr=[^ ]*")
+# berr-reporting restored to original (off) after a clean run (H1)
+final_berr=$(grep -o "berr=[^ ]*" "$tmpdir/fake/can0/config")
 [[ "$final_berr" == "berr=off" ]]
 check $? "berr-reporting should be restored to off (got: $final_berr)"
 
-# Test 3: Verify pause file was cleaned up
 [[ ! -f "$tmpdir/run/watchdog.pause" ]]
 check $? "watchdog.pause should be cleaned up"
 
-# Test 4: Verify lock was released
 [[ ! -f "$tmpdir/run/lock" || ! -f "/proc/$$/fd/9" ]]
 check $? "Lock should be released"
 

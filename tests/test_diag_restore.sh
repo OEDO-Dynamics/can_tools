@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Test can_diag.sh properly restores settings on exit (via trap)
-
-tmpdir=$(mktemp -d)
-# shellcheck disable=SC2064
-trap "rm -rf '$tmpdir'" EXIT
+# Test can_diag.sh's restore-on-exit guarantees (Issue #9 review H1, H2, H3,
+# M1, M2, M4): original restart-ms/berr/fd restored, pause ownership is
+# respected, forced-termination (SIGTERM/SIGINT) still restores and cleans
+# up its candump child, and a hanging `ip` is bounded rather than hanging
+# the whole script.
 
 pass=0 fail=0
 
@@ -17,102 +17,340 @@ check() {
     fi
 }
 
-# Set up test environment
-export CAN_TOOLS_RUN_DIR="$tmpdir/run"
-export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
-
 fakes_path=$(cd "$(dirname "$0")/fakes" && pwd) || exit 1
-export CAN_TOOLS_IP_CMD="$fakes_path/ip"
-export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
-
 diag_fakes_path=$(cd "$(dirname "$0")/diag_fakes" && pwd) || exit 1
-export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+repo_dir=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 
-mkdir -p "$tmpdir/run" "$tmpdir/fake" "$tmpdir/fake/can0" "$tmpdir/fake/can1"
+# ---------------------------------------------------------------------------
+# Test 1: normal run restores berr-reporting and cleans up pause/lock (H1)
+# ---------------------------------------------------------------------------
+run_normal() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
 
-# Initialize fake interfaces with known state
-echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
-echo "restart_ms=100 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
-echo "ERROR-ACTIVE" >"$tmpdir/fake/can1/state"
-echo "restart_ms=100 berr=off fd=on admin=up" >"$tmpdir/fake/can1/config"
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_FAKE_TIME_FILE="$tmpdir/time"
+    echo "1700000000" >"$CAN_TOOLS_FAKE_TIME_FILE"
 
-# Initialize minimal sysfs for candump
-mkdir -p "$tmpdir/sys/class/net/can0/statistics"
-mkdir -p "$tmpdir/sys/class/net/can1/statistics"
-echo "100" >"$tmpdir/sys/class/net/can0/statistics/rx_packets"
-echo "50" >"$tmpdir/sys/class/net/can0/statistics/tx_packets"
-echo "0" >"$tmpdir/sys/class/net/can0/statistics/rx_fifo_errors"
-echo "0" >"$tmpdir/sys/class/net/can0/statistics/tx_fifo_errors"
-echo "100" >"$tmpdir/sys/class/net/can1/statistics/rx_packets"
-echo "0" >"$tmpdir/sys/class/net/can1/statistics/tx_packets"
-echo "0" >"$tmpdir/sys/class/net/can1/statistics/rx_fifo_errors"
-echo "0" >"$tmpdir/sys/class/net/can1/statistics/tx_fifo_errors"
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0" "$tmpdir/fake/can1"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can1/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can1/config"
 
-export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    mkdir -p "$tmpdir/sys/class/net/can0/statistics" "$tmpdir/sys/class/net/can1/statistics"
+    for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+        echo "0" >"$tmpdir/sys/class/net/can0/statistics/$f"
+        echo "0" >"$tmpdir/sys/class/net/can1/statistics/$f"
+    done
 
-echo "Testing can_diag.sh restore on normal exit..."
+    echo "Testing can_diag.sh restore on normal exit..."
+    ( cd "$repo_dir" && bash can_diag.sh 3 >/dev/null 2>&1 )
+    local rc=$?
+    check "$rc" "can_diag.sh should exit cleanly (got rc=$rc)"
 
-cd "$(dirname "$0")/.." || exit 1
+    # restart_ms=0 and fd=on must survive the round trip (PR-B sets
+    # restart-ms 0 as the lib default; a diag run must not flip it back to
+    # 100, nor drop fd - that is exactly the regression H1 guards against).
+    local cfg0 cfg1
+    cfg0=$(cat "$tmpdir/fake/can0/config")
+    cfg1=$(cat "$tmpdir/fake/can1/config")
 
-# Run can_diag.sh (should complete normally and restore settings)
-bash can_diag.sh 3 >/dev/null 2>&1
-rc=$?
+    echo "$cfg0" | grep -q "berr=off"
+    check $? "can0 berr-reporting should be restored to off (got: $cfg0)"
+    echo "$cfg0" | grep -q "restart_ms=0"
+    check $? "can0 restart_ms should be restored to its ORIGINAL value 0, not a default (got: $cfg0)"
+    echo "$cfg0" | grep -q "fd=on"
+    check $? "can0 fd should be restored to its ORIGINAL value on (got: $cfg0)"
 
-check "$rc" "can_diag.sh should exit cleanly"
+    echo "$cfg1" | grep -q "berr=off"
+    check $? "can1 berr-reporting should be restored to off (got: $cfg1)"
+    echo "$cfg1" | grep -q "restart_ms=0"
+    check $? "can1 restart_ms should be restored to 0 (got: $cfg1)"
 
-# Verify berr-reporting was set during operation (ip link set ... up did it)
-# Then restored to original state (off)
-final_can0_config=$(cat "$tmpdir/fake/can0/config")
-final_can1_config=$(cat "$tmpdir/fake/can1/config")
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "watchdog.pause should be cleaned up on exit"
 
-# Config should have berr=off after cleanup (trap restores it)
-echo "$final_can0_config" | grep -q "berr=off"
-check $? "can0 berr-reporting should be restored to off (got: $final_can0_config)"
+    rm -rf "$tmpdir"
+}
 
-echo "$final_can1_config" | grep -q "berr=off"
-check $? "can1 berr-reporting should be restored to off (got: $final_can1_config)"
+# ---------------------------------------------------------------------------
+# Test 2: invalid duration / help exit before any change is made
+# ---------------------------------------------------------------------------
+run_invalid_args() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
 
-# Verify pause file is cleaned up
-if [[ ! -f "$tmpdir/run/watchdog.pause" ]]; then
-    check 0 "watchdog.pause should be cleaned up on exit"
-else
-    check 1 "watchdog.pause should be cleaned up on exit"
-fi
+    echo "Testing can_diag.sh rejects bad input without touching anything..."
 
-# Test error path: simulate signal/early exit
-echo "Testing can_diag.sh restore on error exit..."
+    for bad in "invalid_duration" "0" "61" "-1"; do
+        ( cd "$repo_dir" && bash can_diag.sh "$bad" >/dev/null 2>&1 )
+        local rc=$?
+        if [[ $rc -ne 0 ]]; then check 0 "can_diag.sh $bad should exit non-zero (got rc=$rc)"
+        else check 1 "can_diag.sh $bad should exit non-zero (got rc=$rc)"; fi
+    done
 
-# Reset state
-echo "restart_ms=100 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
-echo "restart_ms=100 berr=off fd=on admin=up" >"$tmpdir/fake/can1/config"
-rm -f "$tmpdir/run/watchdog.pause"
+    # L1: --help must work even mixed with other args, and before validation.
+    ( cd "$repo_dir" && bash can_diag.sh --help >/dev/null 2>&1 )
+    check $? "can_diag.sh --help should exit 0"
+    ( cd "$repo_dir" && bash can_diag.sh 61 --help >/dev/null 2>&1 )
+    check $? "can_diag.sh 61 --help should still print help (checked before duration validation)"
 
-# Create a scenario that will cause can_diag.sh to exit early
-# (e.g., pass an invalid duration)
-bash can_diag.sh "invalid_duration" >/dev/null 2>&1
-rc=$?
+    local _no_pause_rc=0
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]] || _no_pause_rc=1
+    check "$_no_pause_rc" "no pause should have been created for invalid/help invocations"
 
-# Should have exited with error
-if [[ $rc -ne 0 ]]; then
-    check 0 "can_diag.sh should exit with error on invalid input"
-else
-    check 1 "can_diag.sh should exit with error on invalid input"
-fi
+    local cfg0
+    cfg0=$(cat "$tmpdir/fake/can0/config")
+    [[ "$cfg0" == "restart_ms=0 berr=off fd=on admin=up" ]]
+    check $? "can0 config must be untouched by invalid/help invocations (got: $cfg0)"
 
-# Verify cleanup still happened
-if [[ ! -f "$tmpdir/run/watchdog.pause" ]]; then
-    check 0 "watchdog.pause should be cleaned up even on error exit"
-else
-    check 1 "watchdog.pause should be cleaned up even on error exit"
-fi
+    rm -rf "$tmpdir"
+}
 
-# berr should still be off (restored by trap)
-final_can0_config=$(cat "$tmpdir/fake/can0/config")
-if echo "$final_can0_config" | grep -q "berr=off"; then
-    check 0 "berr should be restored to off even on error (got: $final_can0_config)"
-else
-    check 1 "berr should be restored to off even on error (got: $final_can0_config)"
-fi
+# ---------------------------------------------------------------------------
+# Test 3: forced termination (SIGTERM) mid-capture (H1, H2, M4)
+# ---------------------------------------------------------------------------
+run_sigterm() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_DIAG_CANDUMP_HANG=1
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+    mkdir -p "$tmpdir/sys/class/net/can0/statistics"
+    for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+        echo "0" >"$tmpdir/sys/class/net/can0/statistics/$f"
+    done
+
+    echo "Testing can_diag.sh restores state on SIGTERM mid-capture..."
+
+    ( cd "$repo_dir" && exec bash can_diag.sh 30 >"$tmpdir/out.log" 2>&1 ) &
+    local diag_pid=$!
+    sleep 1.5
+
+    # the fake candump (CAN_TOOLS_DIAG_CANDUMP_HANG=1) should now be running
+    pgrep -f "$diag_fakes_path/candump" >/dev/null 2>&1
+    check $? "fake candump should be running before we signal can_diag.sh"
+
+    kill -TERM "$diag_pid" 2>/dev/null
+    wait "$diag_pid" 2>/dev/null
+    local rc=$?
+    local _term_rc=0
+    [[ $rc -ne 0 ]] || _term_rc=1
+    check "$_term_rc" "can_diag.sh killed by SIGTERM should exit non-zero (got rc=$rc)"
+
+    # H2: the candump child must not survive the parent (give --kill-after
+    # + our own escalation a little time to land).
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f "$diag_fakes_path/candump" >/dev/null 2>&1 || break
+        sleep 0.3
+    done
+    if pgrep -f "$diag_fakes_path/candump" >/dev/null 2>&1; then
+        check 1 "fake candump must not survive can_diag.sh being SIGTERM'd (H2)"
+        pkill -KILL -f "$diag_fakes_path/candump" 2>/dev/null || true
+    else
+        check 0 "fake candump must not survive can_diag.sh being SIGTERM'd (H2)"
+    fi
+
+    # H1: restart_ms=0/fd=on must still be restored even on a forced kill.
+    local cfg0
+    cfg0=$(cat "$tmpdir/fake/can0/config")
+    echo "$cfg0" | grep -q "berr=off"
+    check $? "can0 berr-reporting should be restored to off after SIGTERM (got: $cfg0)"
+    echo "$cfg0" | grep -q "restart_ms=0"
+    check $? "can0 restart_ms should be restored to 0 after SIGTERM (got: $cfg0)"
+
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "watchdog.pause should be cleaned up after SIGTERM"
+
+    # lock must be released: we should be able to grab it ourselves, now.
+    exec 8>"$tmpdir/run/lock"
+    flock -n 8
+    check $? "lock should be released after SIGTERM (flock -n should succeed)"
+    exec 8>&-
+
+    unset CAN_TOOLS_DIAG_CANDUMP_HANG
+    rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
+# Test 4: forced termination (SIGINT) mid-capture (M4)
+# ---------------------------------------------------------------------------
+run_sigint() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_DIAG_CANDUMP_HANG=1
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+    mkdir -p "$tmpdir/sys/class/net/can0/statistics"
+    for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+        echo "0" >"$tmpdir/sys/class/net/can0/statistics/$f"
+    done
+
+    echo "Testing can_diag.sh restores state on SIGINT mid-capture..."
+
+    ( cd "$repo_dir" && exec bash can_diag.sh 30 >"$tmpdir/out.log" 2>&1 ) &
+    local diag_pid=$!
+    sleep 1.5
+    kill -INT "$diag_pid" 2>/dev/null
+    wait "$diag_pid" 2>/dev/null
+    local rc=$?
+    [[ $rc -ne 0 ]]
+    check $? "can_diag.sh killed by SIGINT should exit non-zero (got rc=$rc)"
+
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f "$diag_fakes_path/candump" >/dev/null 2>&1 || break
+        sleep 0.3
+    done
+    if pgrep -f "$diag_fakes_path/candump" >/dev/null 2>&1; then
+        check 1 "fake candump must not survive can_diag.sh being SIGINT'd (H2/M4)"
+        pkill -KILL -f "$diag_fakes_path/candump" 2>/dev/null || true
+    else
+        check 0 "fake candump must not survive can_diag.sh being SIGINT'd (H2/M4)"
+    fi
+
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "watchdog.pause should be cleaned up after SIGINT"
+
+    unset CAN_TOOLS_DIAG_CANDUMP_HANG
+    rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
+# Test 5: lock held by someone else -> fail WITHOUT touching their pause (M2a)
+# ---------------------------------------------------------------------------
+run_lock_contention() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_FAKE_TIME_FILE="$tmpdir/time"
+    echo "1700000000" >"$CAN_TOOLS_FAKE_TIME_FILE"
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+
+    echo "Testing can_diag.sh does not clobber another holder's pause when it can't get the lock (M2a)..."
+
+    # Simulate "instance 1": already holding the lock AND an active pause
+    # with a known deadline, well beyond our can_lock timeout (5s default).
+    local original_deadline=1700009999
+    echo "$original_deadline" >"$tmpdir/run/watchdog.pause"
+    (
+        exec 9>"$tmpdir/run/lock"
+        flock -x 9
+        sleep 8
+    ) &
+    local holder_pid=$!
+    sleep 0.3  # let the holder actually acquire the flock first
+
+    ( cd "$repo_dir" && bash can_diag.sh 3 >"$tmpdir/out.log" 2>&1 )
+    local rc=$?
+    local _lockfail_rc=0
+    [[ $rc -ne 0 ]] || _lockfail_rc=1
+    check "$_lockfail_rc" "can_diag.sh should fail when it cannot acquire the lock (got rc=$rc)"
+
+    local final_pause
+    final_pause=$(cat "$tmpdir/run/watchdog.pause" 2>/dev/null)
+    local _pause_match_rc=0
+    [[ "$final_pause" == "$original_deadline" ]] || _pause_match_rc=1
+    check "$_pause_match_rc" "the other holder's pause deadline must be restored exactly, not deleted or left extended (got: $final_pause, want: $original_deadline)"
+
+    local cfg0
+    cfg0=$(cat "$tmpdir/fake/can0/config")
+    [[ "$cfg0" == "restart_ms=0 berr=off fd=on admin=up" ]]
+    check $? "can0 config must be untouched when the lock could not be acquired (got: $cfg0)"
+
+    wait "$holder_pid" 2>/dev/null
+    rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
+# Test 6: a hanging `ip` must not hang can_diag.sh (H3)
+# ---------------------------------------------------------------------------
+run_ip_hang() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export WD_RTNL_TIMEOUT_S=1
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/hang" "$tmpdir/fake/can0"
+    touch "$tmpdir/fake/hang/ip"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+    mkdir -p "$tmpdir/sys/class/net/can0/statistics"
+    for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+        echo "0" >"$tmpdir/sys/class/net/can0/statistics/$f"
+    done
+
+    echo "Testing can_diag.sh bounds a hanging ip via can_run_bounded (H3)..."
+
+    local start end elapsed
+    start=$(date +%s)
+    ( cd "$repo_dir" && timeout 20 bash can_diag.sh 2 >"$tmpdir/out.log" 2>&1 )
+    local rc=$?
+    end=$(date +%s)
+    elapsed=$((end - start))
+
+    [[ $rc -ne 124 ]]
+    check $? "can_diag.sh itself must not be the one timing out (rc=124 would mean it hung; got rc=$rc)"
+    (( elapsed < 15 ))
+    check $? "can_diag.sh should finish well inside 15s despite a hanging ip (took ${elapsed}s)"
+
+    # Clean up the leaked fake `ip` processes can_run_bounded intentionally
+    # does not wait for (that is its documented contract: abandon on 124).
+    pkill -KILL -f "$fakes_path/ip" 2>/dev/null || true
+
+    unset WD_RTNL_TIMEOUT_S
+    rm -rf "$tmpdir"
+}
+
+run_normal
+run_invalid_args
+run_sigterm
+run_sigint
+run_lock_contention
+run_ip_hang
 
 echo ""
 echo "Results: $pass passed, $fail failed"

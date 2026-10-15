@@ -1,53 +1,75 @@
 #!/bin/bash
 
-# tests/fakes/ip - Fake 'ip' command for testing
+# tests/fakes/ip - Fake 'ip' command for testing (§5a)
+#
+# Honors CAN_TOOLS_FAKE_DIR:
+#   <if>/state   - CAN controller STATE string (ERROR-ACTIVE/ERROR-WARNING/
+#                  ERROR-PASSIVE/BUS-OFF/STOPPED). Missing => iface absent.
+#   <if>/config  - single line: "restart_ms=<n> berr=<on/off> fd=<on/off> admin=<up/down>"
+#   calls.log    - every invocation appended verbatim (one line per call)
+#   fail/ip      - if present, exit 1 without doing anything
+#   hang/ip      - if present, never exit (for can_run_bounded timeout tests;
+#                  caller is responsible for killing the leftover process)
 
 fake_dir="${CAN_TOOLS_FAKE_DIR:-.}"
 calls_log="$fake_dir/calls.log"
 
-# Log the call
 echo "$@" >>"$calls_log" 2>/dev/null || true
 
-# Check if we should fail or hang
 [[ -f "$fake_dir/fail/ip" ]] && exit 1
 [[ -f "$fake_dir/hang/ip" ]] && { while true; do sleep 1; done; }
 
-# Parse arguments
+_iface_exists() {
+    local if="$1"
+    [[ -f "$fake_dir/$if/state" || -f "$fake_dir/$if/config" ]]
+}
+
+# Read one field (restart_ms|berr|fd|admin) out of <if>/config. Returns the
+# default if the file or field is missing.
+_cfg_get() {
+    local if="$1" field="$2" default="$3"
+    local cfg="$fake_dir/$if/config"
+    [[ -f "$cfg" ]] || { echo "$default"; return; }
+    local val
+    val=$(grep -o "${field}=[^ ]*" "$cfg" 2>/dev/null | tail -n1 | cut -d= -f2)
+    [[ -n "$val" ]] && echo "$val" || echo "$default"
+}
+
+# Write <if>/config in the single §5a 1-line format, overwriting whichever
+# fields are passed (others keep their current / default value).
+_cfg_write() {
+    local if="$1" restart_ms="$2" berr="$3" fd="$4" admin="$5"
+    mkdir -p "$fake_dir/$if"
+    echo "restart_ms=$restart_ms berr=$berr fd=$fd admin=$admin" >"$fake_dir/$if/config"
+}
+
 case "$1" in
     -d)
         if [[ "$2" == "link" && "$3" == "show" && "$4" == "type" && "$5" == "can" ]]; then
+            idx=1
             for iface_dir in "$fake_dir"/*/; do
                 [[ -d "$iface_dir" ]] || continue
                 iface=$(basename "$iface_dir")
-                [[ -f "$iface_dir/state" || -f "$iface_dir/config" ]] || continue
+                _iface_exists "$iface" || continue
 
-                # N-M3: Support both 1-line and 4-line config formats
-                admin="down"
-                berr="off"
-                fd="off"
-                restart_ms="100"
-
-                if [[ -f "$iface_dir/config" ]]; then
-                    # Read config: can be 1-line format or multi-line format
-                    admin=$(grep -o "admin=[a-z]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "down")
-                    berr=$(grep -o "berr=[a-z]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "off")
-                    fd=$(grep -o "fd=[a-z]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "off")
-                    restart_ms=$(grep -o "restart_ms=[0-9]*" "$iface_dir/config" 2>/dev/null | cut -d= -f2 || echo "100")
-                fi
+                admin=$(_cfg_get "$iface" admin down)
+                berr=$(_cfg_get "$iface" berr off)
+                fd=$(_cfg_get "$iface" fd off)
+                restart_ms=$(_cfg_get "$iface" restart_ms 0)
+                state=$(cat "$fake_dir/$iface/state" 2>/dev/null || echo "ERROR-ACTIVE")
 
                 flags="<NOARP"
                 [[ "$admin" == "up" ]] && flags="$flags,UP,LOWER_UP,ECHO"
-                flags="$flags> mtu 72 qdisc pfifo_fast state UP mode DEFAULT group default qlen 10"
+                flags="$flags>"
 
-                index=$(($(basename "$iface" | sed 's/[^0-9]//g') + 2))
-                echo "$index: $iface: $flags"
-
-                state=$(cat "$iface_dir/state" 2>/dev/null || echo "ERROR-ACTIVE")
+                idx=$((idx + 1))
+                echo "$idx: $iface: $flags mtu 72 qdisc pfifo_fast state UP mode DEFAULT group default qlen 10"
 
                 ctrlmode="<"
-                [[ "$berr" == "on" ]] && ctrlmode="$ctrlmode""BERR-REPORTING,"
-                [[ "$fd" == "on" ]] && ctrlmode="$ctrlmode""FD,"
-                ctrlmode="$ctrlmode""TDC-AUTO>"
+                [[ "$berr" == "on" ]] && ctrlmode="${ctrlmode}BERR-REPORTING,"
+                [[ "$fd" == "on" ]] && ctrlmode="${ctrlmode}FD,"
+                [[ "$fd" == "non-iso" ]] && ctrlmode="${ctrlmode}FD,FD-NON-ISO,"
+                ctrlmode="${ctrlmode}TDC-AUTO>"
 
                 echo "    can $ctrlmode state $state (berr-counter tx 0 rx 0) restart-ms $restart_ms"
             done
@@ -57,8 +79,7 @@ case "$1" in
     "link")
         case "$2" in
             "show")
-                # N-M3: Check for state file or config file to indicate iface exists
-                if [[ -n "$3" && ( -d "$fake_dir/$3" || -f "$fake_dir/$3/state" || -f "$fake_dir/$3/config" ) ]]; then
+                if [[ -n "$3" ]] && _iface_exists "$3"; then
                     echo "1: $3: <NOARP> mtu 72"
                     exit 0
                 fi
@@ -67,35 +88,38 @@ case "$1" in
             "set")
                 if_name="$3"
                 op="$4"
-                [[ -d "$fake_dir/$if_name" ]] || exit 1
+                _iface_exists "$if_name" || exit 1
 
                 case "$op" in
                     "down")
-                        mkdir -p "$fake_dir/$if_name"
-                        sed -i 's/^admin=.*/admin=down/' "$fake_dir/$if_name/config" 2>/dev/null || echo "admin=down" >"$fake_dir/$if_name/config"
+                        restart_ms=$(_cfg_get "$if_name" restart_ms 0)
+                        berr=$(_cfg_get "$if_name" berr off)
+                        fd=$(_cfg_get "$if_name" fd off)
+                        _cfg_write "$if_name" "$restart_ms" "$berr" "$fd" down
                         exit 0
                         ;;
                     "up")
-                        mkdir -p "$fake_dir/$if_name"
                         shift 4
                         restart_ms="" berr="off" fd="off"
                         while [[ $# -gt 0 ]]; do
                             case "$1" in
-                                type) shift 2;;
-                                bitrate|dbitrate) shift 2;;
-                                restart-ms) restart_ms="$2"; shift 2;;
-                                berr-reporting) berr="$2"; shift 2;;
-                                fd) fd="$2"; shift 2;;
-                                *) shift;;
+                                type) shift 2 ;;
+                                bitrate|dbitrate) shift 2 ;;
+                                restart-ms) restart_ms="$2"; shift 2 ;;
+                                berr-reporting) berr="$2"; shift 2 ;;
+                                fd) fd="$2"; shift 2 ;;
+                                *) shift ;;
                             esac
                         done
-                        # N-M3: Write 1-line format config
-                        echo "restart_ms=${restart_ms:-100} berr=$berr fd=$fd admin=up" >"$fake_dir/$if_name/config"
+                        _cfg_write "$if_name" "${restart_ms:-0}" "$berr" "$fd" up
                         exit 0
                         ;;
                     "name")
                         newname="$5"
-                        [[ -n "$newname" && "$if_name" != "$newname" ]] && { [[ -d "$fake_dir/$newname" ]] && exit 1; mv "$fake_dir/$if_name" "$fake_dir/$newname" 2>/dev/null || exit 1; }
+                        if [[ -n "$newname" && "$if_name" != "$newname" ]]; then
+                            [[ -d "$fake_dir/$newname" ]] && exit 1
+                            mv "$fake_dir/$if_name" "$fake_dir/$newname" 2>/dev/null || exit 1
+                        fi
                         exit 0
                         ;;
                     "txqueuelen")

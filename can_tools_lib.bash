@@ -115,6 +115,10 @@ _can_validate_value() {
                 return 1
             fi
             ;;
+        CAN_IFACES|CAN_FLUSH_IFACES|CAN_SPI_MAP|CAN_DEPENDENT_UNITS)
+            # N-M2: name/list keys get character-type validation, not a free pass.
+            _can_validate_names "$key" "$val"
+            ;;
         *)
             echo "$val"
             ;;
@@ -284,48 +288,77 @@ can_run_bounded() {
 
 # CAN Interface State Reading (§2b)
 # can_iface_states
-# Call can_run_bounded once, parse stdout (N-H1: read from stdout directly)
+# IMPORTANT: this function must be called as a plain command (e.g.
+#   can_iface_states >"$file"; rc=$?; ... read from "$file" ...
+# ), never wrapped in $( ) or < <( ). Both of those fork a subshell, and the
+# CAN_RUN_BOUNDED_PID this function sets (via can_run_bounded, called below
+# with a plain redirection so it stays in the CURRENT shell) would then be
+# lost when the subshell exits. That silently defeats can_run_bounded's "do
+# not start a new child while the previous one is still alive" guard (R2):
+# every call would spawn its own hung `ip`, leaking one D-state-adjacent
+# process per watchdog cycle instead of capping at one. Internally this
+# function also avoids `< <(can_run_bounded ...)` / `$(can_run_bounded ...)`
+# for the exact same reason, reading the captured output from a plain file
+# redirect instead.
 can_iface_states() {
-    # Define regexes as variables
-    local re_iface='^[0-9]+: ([^:@]+)[:@] ([^[:space:]]*)'
-    local re_can='^[[:space:]]+can ([^s]*)state ([A-Z-]+)'
+    # §2b regexes, verbatim:
+    #   iface line:  ^[0-9]+: ([^:@]+)[:@] <([^>]*)>
+    #   CAN line:    ^[[:space:]]+can (<([^>]*)> )?state ([A-Z-]+)
+    #   restart-ms:  restart-ms ([0-9]+)
+    local re_iface='^[0-9]+: ([^:@]+)[:@] <([^>]*)>'
+    local re_can='^[[:space:]]+can (<([^>]*)> )?state ([A-Z-]+)'
     local re_restart='restart-ms ([0-9]+)'
 
-    # Parse the output from can_run_bounded stdout (N-H1: 1 call only, pipe directly)
-    local if_name if_state if_admin restart_ms berr fd ctrlmode
+    local run_dir="${CAN_TOOLS_RUN_DIR:-/run/can_tools}"
+    mkdir -p "$run_dir" 2>/dev/null || true
+    local outfile="$run_dir/iface_states_$$.tmp"
+
+    # N-H1: plain redirection, NOT $( ) / < <( ) - runs in the current shell so
+    # CAN_RUN_BOUNDED_PID set by can_run_bounded is preserved for the next call.
+    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can >"$outfile" 2>&1
+    local rc=$?
+
+    if (( rc == 124 )); then
+        rm -f "$outfile"
+        return 124
+    fi
+
+    local if_name if_state if_admin restart_ms berr fd ctrlmode flags
     local found=0
 
-    while IFS= read -r line; do
-        # Iface line
-        if [[ $line =~ $re_iface ]]; then
-            if_name="${BASH_REMATCH[1]}"
-            if_admin="down"
-            # Check for UP flag (exact match, not substring like LOWER_UP)
-            [[ "${BASH_REMATCH[2]}" =~ ,UP, || "${BASH_REMATCH[2]}" =~ ^UP, || "${BASH_REMATCH[2]}" =~ ,UP$ || "${BASH_REMATCH[2]}" == "UP" ]] && if_admin="up"
-        fi
-
-        # CAN state line
-        if [[ $line =~ $re_can ]]; then
-            ctrlmode="${BASH_REMATCH[1]}"
-            if_state="${BASH_REMATCH[2]}"
-
-            # Parse restart-ms
-            restart_ms=0
-            if [[ $line =~ $re_restart ]]; then
-                restart_ms="${BASH_REMATCH[1]}"
+    if [[ -f "$outfile" ]]; then
+        while IFS= read -r line; do
+            # Iface line: admin is up only if "UP" is one of the comma-separated
+            # flags inside <...> (not a substring match like LOWER_UP).
+            if [[ $line =~ $re_iface ]]; then
+                if_name="${BASH_REMATCH[1]}"
+                flags=",${BASH_REMATCH[2]},"
+                if_admin="down"
+                [[ "$flags" == *,UP,* ]] && if_admin="up"
             fi
 
-            # Parse flags - check complete ctrlmode field (L1)
-            berr="off"
-            fd="off"
-            [[ "$ctrlmode" =~ BERR-REPORTING ]] && berr="on"
-            [[ "$ctrlmode" =~ [,\<]FD[,\>] ]] && fd="on"  # Exact FD match
+            # CAN state line (group 3 is STATE; do not confuse with operstate's
+            # "state UP" on the iface line above)
+            if [[ $line =~ $re_can ]]; then
+                ctrlmode="${BASH_REMATCH[2]}"
+                if_state="${BASH_REMATCH[3]}"
 
-            echo "$if_name $if_state restart_ms=$restart_ms berr=$berr fd=$fd admin=$if_admin"
-            (( found++ ))
-        fi
-    done < <(can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" \
-        "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can 2>&1)
+                restart_ms=0
+                [[ $line =~ $re_restart ]] && restart_ms="${BASH_REMATCH[1]}"
+
+                # Exact flag match within ctrlmode (comma-delimited), so
+                # FD-NON-ISO never matches plain FD.
+                berr="off"
+                fd="off"
+                [[ ",$ctrlmode," == *,BERR-REPORTING,* ]] && berr="on"
+                [[ ",$ctrlmode," == *,FD,* ]] && fd="on"
+
+                echo "$if_name $if_state restart_ms=$restart_ms berr=$berr fd=$fd admin=$if_admin"
+                (( found++ ))
+            fi
+        done < "$outfile"
+        rm -f "$outfile"
+    fi
 
     [[ $found -eq 0 ]] && return 1
     return 0

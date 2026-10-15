@@ -133,6 +133,62 @@ can_unlock
 timeout 1 bash -c 'flock -w 1 9 2>/dev/null' 9>"$tmpdir/run/lock" 2>/dev/null
 if [[ $? -eq 0 ]]; then check 0 "lock should be acquirable by another process once released"; else check 1 "lock should be acquirable by another process once released"; fi
 
+# ========== _can_is_alive tests (H4 CPU: now fork-free, builtin `read` +
+# parameter expansion instead of `awk`) ==========
+echo "Testing _can_is_alive..."
+
+# alive: a real, running process (this shell itself).
+_can_is_alive "$$"
+check $? "_can_is_alive should report the current shell (a running process) as alive"
+
+# nonexistent: a pid that (almost certainly) does not exist. can_run_bounded's
+# hang tests below additionally cover the "was alive, got killed, becomes not
+# alive" transition once the kernel actually reaps it -- that's the semantics
+# that matter operationally (R2's hung-child guard).
+_can_is_alive 999999
+if [[ $? -ne 0 ]]; then check 0 "_can_is_alive should report a nonexistent pid as not alive"; else check 1 "_can_is_alive should report a nonexistent pid as not alive"; fi
+
+# genuine zombie: `( sleep 0.1 & exec sleep 1 )` backgrounds a short-lived
+# child, then `exec`s the SUBSHELL itself into a plain `sleep 1` binary --
+# which has no SIGCHLD/job-control handling at all, so when the short-lived
+# child dies it is never reaped and stays a real 'Z' until the outer `sleep
+# 1` itself is killed below. (A plain backgrounded bash child gets reaped by
+# bash's own job control almost immediately, which is why this needs the
+# exec trick to actually observe 'Z'.)
+( sleep 0.1 & exec sleep 1 ) &
+zparent=$!
+sleep 0.4
+zpid=$(pgrep -P "$zparent" 2>/dev/null)
+if [[ -n "$zpid" ]]; then
+    zstat_line=$(cat "/proc/$zpid/stat" 2>/dev/null)
+    _can_is_alive "$zpid"
+    zrc=$?
+    if [[ $zrc -ne 0 ]]; then check 0 "_can_is_alive should report a real zombie as not alive (/proc/$zpid/stat: $zstat_line)"; else check 1 "_can_is_alive should report a real zombie as not alive (/proc/$zpid/stat: $zstat_line)"; fi
+else
+    check 1 "_can_is_alive zombie test setup failed: pgrep (procps) found no child of $zparent -- is pgrep installed?"
+fi
+kill "$zparent" 2>/dev/null
+wait "$zparent" 2>/dev/null
+
+# a real process whose comm contains ") " -- the case a naive whitespace
+# split (or `awk '{print $3}'`) would misparse, since /proc/<pid>/stat's
+# comm field is "(a) b)" here (the executable's own basename, in parens,
+# containing its own ')'). Copying /bin/sleep under a funky name is the only
+# portable way to control comm's actual content (it is NOT argv[0] / `exec
+# -a`, which this field ignores).
+paren_bin="$tmpdir/a) b"
+if cp /bin/sleep "$paren_bin" 2>/dev/null; then
+    "$paren_bin" 2 &
+    paren_pid=$!
+    sleep 0.2
+    _can_is_alive "$paren_pid"
+    check $? "_can_is_alive should report a running process with ')' in its comm as alive"
+    kill "$paren_pid" 2>/dev/null
+    wait "$paren_pid" 2>/dev/null
+else
+    check 1 "_can_is_alive comm-with-parens test setup failed: could not copy /bin/sleep"
+fi
+
 # ========== can_run_bounded tests ==========
 echo "Testing can_run_bounded..."
 

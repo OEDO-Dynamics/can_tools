@@ -1,6 +1,7 @@
 [Unit]
 Description=CAN Hat FD Setup Service
-After=network.target
+After=network.target canhat_fd_rename.service
+Wants=canhat_fd_rename.service
 
 [Service]
 Type=oneshot

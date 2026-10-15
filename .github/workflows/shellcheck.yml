@@ -1,0 +1,68 @@
+name: shellcheck
+
+on: [push, pull_request]
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck with -S warning
+        run: |
+          # Install shellcheck if not available
+          if ! command -v shellcheck &> /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+
+          # Run shellcheck on repo-root *.sh and *.bash files, tests/
+          # Exclude can-utils/, openimu/
+          # Exclude files that will be modified in later PRs (PR-A2, PR-B):
+          #   - canhat_fd_setup.bash
+          #   - canhat_fd_rename.bash
+          #   - enable_canhat_fd.sh
+          #   - can_monitor.sh
+
+          echo "=== Running shellcheck -S warning ==="
+
+          # Build file list
+          files=()
+
+          # Add repo-root *.sh and *.bash (excluding excluded patterns)
+          while IFS= read -r f; do
+              # Skip excluded files/dirs
+              if [[ "$f" == "can-utils/"* ]] || [[ "$f" == "openimu/"* ]]; then
+                  continue
+              fi
+              # Skip files to be modified in later PRs
+              if [[ "$f" == "canhat_fd_setup.bash" ]] || \
+                 [[ "$f" == "canhat_fd_rename.bash" ]] || \
+                 [[ "$f" == "enable_canhat_fd.sh" ]] || \
+                 [[ "$f" == "can_monitor.sh" ]]; then
+                  continue
+              fi
+              files+=("$f")
+          done < <(find . -maxdepth 1 -type f \( -name "*.sh" -o -name "*.bash" \) | sort)
+
+          # Add tests/ files (excluding fakes/ directory for now, only test_*.sh)
+          while IFS= read -r f; do
+              if [[ "$f" == "tests/test_"* ]]; then
+                  files+=("$f")
+              fi
+          done < <(find tests/ -type f \( -name "*.sh" -o -name "*.bash" \) | sort)
+
+          if (( ${#files[@]} > 0 )); then
+              shellcheck -S warning "${files[@]}"
+              rc=$?
+          else
+              echo "No shell files found to check"
+              rc=0
+          fi
+
+          exit $rc
+
+      - name: Run tests
+        run: |
+          cd tests
+          bash run.sh

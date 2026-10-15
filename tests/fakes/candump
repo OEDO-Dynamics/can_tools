@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# Fake candump for testing can_diag.sh
+# Outputs test error frames or data from scenario files
+
+fake_dir="${CAN_TOOLS_FAKE_DIR:-.}"
+
+# Check for explicit scenario file
+if [[ -n "${CAN_TOOLS_CANDUMP_SCENARIO:-}" ]]; then
+    if [[ -f "$fake_dir/candump/$CAN_TOOLS_CANDUMP_SCENARIO" ]]; then
+        cat "$fake_dir/candump/$CAN_TOOLS_CANDUMP_SCENARIO"
+        exit 0
+    fi
+fi
+
+# Default: output some error frames
+# Format: (iface) error_id#data (where data[2] = error type, data[3] = position)
+# Error types:
+#   0x01 = bit_error
+#   0x02 = form_error
+#   0x04 = stuff_error
+#   0x08 = bit0_error
+#   0x10 = bit1_error
+#   0x20 = ack_error
+#   0x40 = prot_error
+
+cat <<'EOF'
+(can0) C0000104#010A000010000000
+(can0) C0000104#010B000010000000
+(can0) C0000104#020A000010000000
+(can1) C0000104#010C000010000000
+(can0) C0000104#040A000010000000
+(can0) C0000104#200A000010000000
+(can0) C0000104#010D000010000000
+EOF
+
+exit 0

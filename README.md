@@ -15,64 +15,88 @@
 
 ### Quick Install
 
-Install can_tools to `/opt/can_tools`:
 ```bash
+git clone --recursive https://github.com/RyodoTanaka/can_tools.git
 cd can_tools
-sudo bash install.sh
+sudo ./install.sh
 ```
 
-The installer is **idempotent** and **non-destructive**:
-- Files are only updated if changed
-- Existing configuration (`/opt/can_tools/can_tools.conf`) is never overwritten
-- Running services are not restarted
+This installs can_tools to `/opt/can_tools`, copies the `canhat_fd_*` /
+`canhat_plus_*` systemd units into `/etc/systemd/system`, enables them, and
+creates `/run/can_tools` and `/var/lib/can_tools` (plus a `tmpfiles.d`
+drop-in so they survive a reboot). It is **idempotent** and
+**non-destructive**:
+- Files are only written if their contents changed.
+- Existing configuration (`/opt/can_tools/can_tools.conf`) is never
+  overwritten; `install.sh` creates it (empty) only on first install, and
+  `can_tools.conf.example` is always refreshed alongside it so the two never
+  drift apart.
+- Running services are never stopped or restarted by `install.sh` - **not
+  even `canhat_fd_setup.service`**. Bringing CAN interfaces down/up while the
+  machine is live was the trigger for a prior field incident (see the
+  "Applying configuration changes" note below).
+- A legacy unit that was deployed as a symlink straight into
+  `/opt/can_tools/*.service` is replaced with a real copy (same no-restart
+  guarantee).
+- The retired `can_monitor.timer`/`can_monitor.service` are stopped,
+  disabled and removed if still present from an older install;
+  `/var/log/can_monitor.log` itself is left alone.
+
+To see what would change without touching anything:
+```bash
+sudo ./install.sh --check
+```
+It prints a `diff -u` for every file that would change and exits non-zero if
+there is anything to install; running it twice in a row should show no
+differences and exit 0.
 
 ### Configuration
 
-Configuration is read from `/opt/can_tools/can_tools.conf` (if it exists) or uses built-in defaults. Create a configuration file by copying the example:
+`/opt/can_tools/can_tools.conf` is read if it exists, otherwise built-in
+defaults apply. `install.sh` already creates an empty copy (all lines
+commented out) on first install - write only the keys you want to override:
 ```bash
-sudo cp /opt/can_tools/can_tools.conf.example /opt/can_tools/can_tools.conf
 sudo nano /opt/can_tools/can_tools.conf
 ```
 
 **Key settings:**
 - `CAN_IFACES` - Space-separated interface names (default: `can0 can1`)
 - `CAN_SPI_MAP` - SPI device to interface name mapping (default: `spi0.0:can0 spi1.0:can1`)
-- `CAN_BITRATE` - Bitrate in kbps (default: `250000`)
+- `CAN_BITRATE` - Bitrate in bps (default: `250000`)
 - `CAN_FD` - Enable CAN FD (default: `on`)
 - `CAN_TXQUEUELEN` - TX queue length (default: `10`)
 
 For full option details, see `/opt/can_tools/can_tools.conf.example`.
 
+#### Applying configuration changes
+
+A conf edit (or a reinstall that updates a script) only takes effect:
+- at the **next reboot**, or
+- by running `sudo systemctl restart canhat_fd_setup.service` while the
+  **machine is stopped** (hydraulics locked, implement down, key state
+  decided).
+
+Never restart it, or run `ip link set ... down/up`, while the machine is
+live - bringing CAN down/up while the controller is sending/receiving is
+what caused the 2026-10-14 incident. Until the next reboot (or that manual,
+machine-stopped restart), the running `canhat_fd_setup.service` keeps using
+the previously-applied settings.
+
 ### Systemd Services
 
-After installation, enable the appropriate setup service for your hardware:
+`install.sh` already installs and enables these units; they are started by
+systemd itself at boot (`WantedBy=multi-user.target`). Use `systemctl
+status`/`journalctl -u` to check them - don't `systemctl start`/`restart`
+them manually on a live machine (see above).
 
 **CAN HAT FD** (supports CAN FD at 2 Mbps data rate):
 ```bash
-sudo systemctl enable canhat_fd_rename.service canhat_fd_setup.service
-sudo systemctl start canhat_fd_rename.service canhat_fd_setup.service
-sudo systemctl status canhat_fd_setup.service
+sudo systemctl status canhat_fd_rename.service canhat_fd_setup.service
 ```
 
 **CAN HAT Plus** (standard CAN only):
 ```bash
-sudo systemctl enable canhat_plus_rename.service canhat_plus_setup.service
-sudo systemctl start canhat_plus_rename.service canhat_plus_setup.service
-sudo systemctl status canhat_plus_setup.service
-```
-
-**CAN Monitor Service** (optional, watches interface health):
-```bash
-sudo systemctl enable can_monitor.service
-sudo systemctl start can_monitor.service
-sudo journalctl -u can_monitor.service -f  # View logs
-```
-
-### Check for Installation Changes
-
-To see what would be changed without making any changes:
-```bash
-sudo CHECK_MODE=1 bash install.sh
+sudo systemctl status canhat_plus_rename.service canhat_plus_setup.service
 ```
 
 ## CAN Interface Setup

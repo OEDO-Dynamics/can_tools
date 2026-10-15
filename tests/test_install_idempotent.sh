@@ -22,6 +22,13 @@ check() {
 
 # Every call below runs the real install.sh, pointed entirely at a scratch
 # tree via env vars - no sudo, no real /opt or /etc touched.
+#
+# CAN_TOOLS_MONITOR_STOP_TIMEOUT_S=0: tests/fakes/systemctl always exits 0
+# for `is-active` (it does not model active/inactive), so the M-new2
+# wait-for-inactive loop would otherwise always run to its full timeout.
+# Forcing it to 0 keeps the one is-active check (proving the code path runs)
+# without a real wait; it is still never a `stop`, which is the property
+# M-new2 cares about.
 run_install() {
     local opt="$1" systemd="$2" tmpfiles="$3" run="$4" state="$5" fake="$6"
     shift 6
@@ -30,6 +37,7 @@ run_install() {
         INSTALL_OPT_DIR="$opt" SYSTEMD_DIR="$systemd" TMPFILES_DIR="$tmpfiles" \
         CAN_TOOLS_RUN_DIR="$run" CAN_TOOLS_STATE_DIR="$state" \
         CAN_TOOLS_FAKE_DIR="$fake" CAN_TOOLS_SYSTEMCTL_CMD="$fakes_dir/systemctl" \
+        CAN_TOOLS_MONITOR_STOP_TIMEOUT_S=0 \
         bash "$repo_root/install.sh" "$@"
 }
 
@@ -97,8 +105,11 @@ rc=$?
 (( rc != 0 )); check $? "--check against an empty destination should report differences (rc!=0), got $rc"
 if [[ ! -e "$s2/opt/can_tools" || -z "$(ls -A "$s2/opt/can_tools" 2>/dev/null)" ]]; then rc=0; else rc=1; fi
 check "$rc" "--check must not create any file under an empty destination"
-if [[ ! -s "$s2/fake/calls.log" ]]; then rc=0; else rc=1; fi
-check "$rc" "--check must not call systemctl at all"
+# --check does call systemctl is-enabled now (L-new1: read-only, reports
+# enable-state diffs), but must never mutate anything (enable/disable/
+# stop/start/daemon-reload).
+if [[ ! -s "$s2/fake/calls.log" ]] || ! grep -qvx "is-enabled .*" "$s2/fake/calls.log"; then rc=0; else rc=1; fi
+check "$rc" "--check must only call systemctl is-enabled (read-only), never mutate anything: $(cat "$s2/fake/calls.log" 2>/dev/null)"
 
 # For a file that already exists but differs, --check must print an actual
 # unified diff (H1), not just "would install".
@@ -168,8 +179,16 @@ grep -q "^stop can_monitor.timer$" "$s4/fake/calls.log"
 check $? "can_monitor.timer should be stopped before removal"
 grep -q "^disable can_monitor.timer$" "$s4/fake/calls.log"
 check $? "can_monitor.timer should be disabled before removal"
-grep -q "^stop can_monitor.service$" "$s4/fake/calls.log"
-check $? "can_monitor.service should be stopped before removal"
+
+# M-new2: can_monitor.service is a oneshot that itself down/up's an
+# interface; install.sh must wait for it to go inactive instead of sending
+# it a stop (which could land mid-down/up and leave the interface down).
+if ! grep -q "^stop can_monitor.service$" "$s4/fake/calls.log"; then rc=0; else rc=1; fi
+check "$rc" "can_monitor.service must NEVER be sent a stop (M-new2): $(cat "$s4/fake/calls.log")"
+grep -q "^is-active can_monitor.service$" "$s4/fake/calls.log"
+check $? "can_monitor.service should be polled with is-active before disabling it (M-new2)"
+grep -q "^disable can_monitor.service$" "$s4/fake/calls.log"
+check $? "can_monitor.service should still be disabled"
 
 # A second run after scenario 4 should be a clean no-op via --check.
 run_install "$s4/opt" "$s4/systemd" "$s4/tmpfiles" "$s4/run" "$s4/state" "$s4/fake" --check >"$tmpdir/s4_check.log" 2>&1
@@ -183,8 +202,7 @@ rc=$?
 # running it against the real / is exactly what we must never do in a test.
 # ---------------------------------------------------------------------
 echo "Scenario 5: root check is skipped for a scratch destination"
-[[ "$(id -u)" -ne 0 ]]
-if [[ $? -eq 0 ]]; then
+if [[ "$(id -u)" -ne 0 ]]; then
     s5="$tmpdir/s5"
     mkdir -p "$s5/opt" "$s5/systemd" "$s5/tmpfiles" "$s5/run" "$s5/state" "$s5/fake"
     run_install "$s5/opt" "$s5/systemd" "$s5/tmpfiles" "$s5/run" "$s5/state" "$s5/fake" >/dev/null 2>&1
@@ -193,6 +211,84 @@ if [[ $? -eq 0 ]]; then
 else
     echo "  (running as root - skipping non-root-specific assertion)"
 fi
+
+# ---------------------------------------------------------------------
+# Scenario 6 (C-new1): canhat_plus_* units must never be installed/enabled
+# by default - only canhat_fd_rename/setup (and, once it exists,
+# can_watchdog) are §4-3's install/enable targets. canhat_plus_setup.service
+# has no After=/Before=/lock relationship with canhat_fd_setup.service, so
+# enabling it unconditionally on an FD machine would let it race the FD
+# setup and overwrite its txqueuelen/restart-ms. --plus opts in explicitly.
+# ---------------------------------------------------------------------
+echo "Scenario 6: canhat_plus_* is never installed/enabled without --plus (C-new1)"
+s6="$tmpdir/s6"
+mkdir -p "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake"
+
+run_install "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake" >/dev/null 2>&1
+rc=$?
+(( rc == 0 )); check $? "plain install should still succeed"
+
+if [[ ! -e "$s6/systemd/canhat_plus_setup.service" ]]; then rc=0; else rc=1; fi
+check "$rc" "canhat_plus_setup.service must not be installed by default (C-new1)"
+if [[ ! -e "$s6/systemd/canhat_plus_rename.service" ]]; then rc=0; else rc=1; fi
+check "$rc" "canhat_plus_rename.service must not be installed by default (C-new1)"
+if ! grep -qi "canhat_plus" "$s6/fake/calls.log" 2>/dev/null; then rc=0; else rc=1; fi
+check "$rc" "systemctl must never be told to enable canhat_plus_* without --plus (C-new1): $(cat "$s6/fake/calls.log" 2>/dev/null)"
+if [[ -f "$s6/opt/can_tools/canhat_plus_setup.bash" ]]; then rc=0; else rc=1; fi
+check "$rc" "the canhat_plus_* scripts themselves are still copied (harmless, never run on their own)"
+
+# With --plus, the units ARE installed and enabled.
+s6b="$tmpdir/s6b"
+mkdir -p "$s6b/opt" "$s6b/systemd" "$s6b/tmpfiles" "$s6b/run" "$s6b/state" "$s6b/fake"
+run_install "$s6b/opt" "$s6b/systemd" "$s6b/tmpfiles" "$s6b/run" "$s6b/state" "$s6b/fake" --plus >/dev/null 2>&1
+rc=$?
+(( rc == 0 )); check $? "--plus install should succeed"
+if [[ -f "$s6b/systemd/canhat_plus_setup.service" ]]; then rc=0; else rc=1; fi
+check "$rc" "--plus should install canhat_plus_setup.service"
+grep -q "^enable canhat_plus_setup.service$" "$s6b/fake/calls.log"
+check $? "--plus should enable canhat_plus_setup.service"
+grep -q "^enable canhat_plus_rename.service$" "$s6b/fake/calls.log"
+check $? "--plus should enable canhat_plus_rename.service"
+
+# ---------------------------------------------------------------------
+# Scenario 7 (L-new1): --check should also flag a unit that is installed
+# but not enabled, not just file-content differences.
+# ---------------------------------------------------------------------
+echo "Scenario 7: --check reports a not-yet-enabled unit (L-new1)"
+s7="$tmpdir/s7"
+mkdir -p "$s7/opt" "$s7/systemd" "$s7/tmpfiles" "$s7/run" "$s7/state" "$s7/fake"
+# A systemctl stub whose is-enabled always fails (disabled), everything else
+# behaves like tests/fakes/systemctl (log + succeed) - this is a small,
+# self-contained stub for this one test, not a change to tests/fakes/.
+cat >"$tmpdir/systemctl_disabled" <<EOF
+#!/bin/bash
+fake_dir="\${CAN_TOOLS_FAKE_DIR:-.}"
+echo "\$@" >>"\$fake_dir/calls.log" 2>/dev/null || true
+[[ "\$1" == "is-enabled" ]] && exit 1
+exit 0
+EOF
+chmod +x "$tmpdir/systemctl_disabled"
+
+env -i PATH="$fakes_dir:/usr/bin:/bin" \
+    INSTALL_OPT_DIR="$s7/opt" SYSTEMD_DIR="$s7/systemd" TMPFILES_DIR="$s7/tmpfiles" \
+    CAN_TOOLS_RUN_DIR="$s7/run" CAN_TOOLS_STATE_DIR="$s7/state" \
+    CAN_TOOLS_FAKE_DIR="$s7/fake" CAN_TOOLS_SYSTEMCTL_CMD="$tmpdir/systemctl_disabled" \
+    CAN_TOOLS_MONITOR_STOP_TIMEOUT_S=0 \
+    bash "$repo_root/install.sh" >/dev/null 2>&1
+rc=$?
+(( rc == 0 )); check $? "first (real) install with the always-disabled stub should still succeed"
+
+run_check_log="$tmpdir/s7_check.log"
+env -i PATH="$fakes_dir:/usr/bin:/bin" \
+    INSTALL_OPT_DIR="$s7/opt" SYSTEMD_DIR="$s7/systemd" TMPFILES_DIR="$s7/tmpfiles" \
+    CAN_TOOLS_RUN_DIR="$s7/run" CAN_TOOLS_STATE_DIR="$s7/state" \
+    CAN_TOOLS_FAKE_DIR="$s7/fake" CAN_TOOLS_SYSTEMCTL_CMD="$tmpdir/systemctl_disabled" \
+    CAN_TOOLS_MONITOR_STOP_TIMEOUT_S=0 \
+    bash "$repo_root/install.sh" --check >"$run_check_log" 2>&1
+rc=$?
+(( rc != 0 )); check $? "--check should report a difference when a managed unit is not enabled (L-new1), got rc=$rc: $(cat "$run_check_log")"
+grep -qi "would enable" "$run_check_log"
+check $? "--check should explicitly mention the unit needs enabling (L-new1): $(cat "$run_check_log")"
 
 echo ""
 echo "Results: $pass passed, $fail failed"

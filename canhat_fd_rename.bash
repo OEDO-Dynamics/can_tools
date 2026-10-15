@@ -14,14 +14,17 @@
 #      temporary one
 #   5. can_unlock
 #
-# Exit status (L4): a hard failure while actually swapping names (an `ip`
-# command itself failing) is reported as exit 1, so the oneshot unit shows
-# failed and the condition is visible. A spidev that never gets a netdev
-# within the 10s wait (missing hardware, or probe taking longer than 10s) is
-# logged as a WARNING but does not fail the unit - Before=canhat_fd_setup.service
-# docker.service is ordering only, not a dependency on success, and a
-# permanently-failed oneshot unit for "one CAN HAT channel is still probing"
-# is not actionable here (the watchdog's degraded-iface reporting covers it).
+# Exit status (L4, disambiguated at the call site per L-new2): a spidev that
+# never gets a netdev within the 10s wait (missing hardware, or probe taking
+# longer than 10s) is logged as a WARNING and does not fail the unit -
+# Before=canhat_fd_setup.service docker.service is ordering only, not a
+# dependency on success, and a permanently-failed oneshot unit for "one CAN
+# HAT channel is still probing" is not actionable here (the watchdog's
+# degraded-iface reporting covers it). Any other failure - the down/rename
+# `ip` call itself failing once the netdev is confirmed present, or a swap
+# failing partway (best-effort rolled back so no interface is left named
+# "can_tmp_<pid>", L-new3) - is a real operational failure and is reported
+# as exit 1, so the oneshot unit shows failed and the condition is visible.
 
 set -euo pipefail
 
@@ -93,6 +96,19 @@ for i in "${!spidevs[@]}"; do
     spidev="${spidevs[$i]}"
     want="${wants[$i]}"
 
+    # L-new2: can_pin_name returns rc=1 both when the spidev has no netdev
+    # at all (missing hardware - should just WARNING and exit 0 per L4) and
+    # when the netdev exists but the down/rename `ip` call itself failed
+    # (a real operational failure - should ERROR and exit 1). The lib does
+    # not distinguish these itself (tracked as a lib-side follow-up; see the
+    # PR comment), so disambiguate here by checking presence ourselves
+    # first, before calling can_pin_name at all.
+    if ! can_iface_of_spidev "$spidev" >/dev/null 2>&1; then
+        can_log WARNING "iface=$spidev want=$want reason=missing_netdev"
+        missing_warned=1
+        continue
+    fi
+
     # can_pin_name itself calls can_run_bounded; call it as a plain command
     # (never inside $( )), per the lib's calling contract. It is wrapped in
     # `if` (rather than a bare statement + $?) so that this script's
@@ -120,23 +136,59 @@ for i in "${!spidevs[@]}"; do
                 continue
             fi
 
+            # L-new3: track how far the swap got so a failure partway
+            # through can be rolled back - the oneshot unit will fail
+            # either way (visible), but the interfaces should not be left
+            # stuck under the temporary name.
             tmp_name="can_tmp_$$"
-            if can_run_bounded "$timeout" "$ip_cmd" link set "$current" down >/dev/null 2>&1 \
-                && can_run_bounded "$timeout" "$ip_cmd" link set "$want" down >/dev/null 2>&1 \
-                && can_run_bounded "$timeout" "$ip_cmd" link set "$want" name "$tmp_name" >/dev/null 2>&1 \
-                && can_run_bounded "$timeout" "$ip_cmd" link set "$current" name "$want" >/dev/null 2>&1 \
-                && can_run_bounded "$timeout" "$ip_cmd" link set "$tmp_name" name "$current" >/dev/null 2>&1; then
+            swap_step=0
+            swap_ok=0
+            if can_run_bounded "$timeout" "$ip_cmd" link set "$current" down >/dev/null 2>&1; then
+                swap_step=1
+                if can_run_bounded "$timeout" "$ip_cmd" link set "$want" down >/dev/null 2>&1; then
+                    swap_step=2
+                    if can_run_bounded "$timeout" "$ip_cmd" link set "$want" name "$tmp_name" >/dev/null 2>&1; then
+                        swap_step=3
+                        if can_run_bounded "$timeout" "$ip_cmd" link set "$current" name "$want" >/dev/null 2>&1; then
+                            swap_step=4
+                            if can_run_bounded "$timeout" "$ip_cmd" link set "$tmp_name" name "$current" >/dev/null 2>&1; then
+                                swap_ok=1
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+
+            if (( swap_ok )); then
                 can_log INFO "action=swap from=$current to=$want"
             else
-                can_log ERR "action=swap_failed from=$current to=$want"
+                can_log ERR "action=swap_failed from=$current to=$want step=$swap_step"
+                # Best-effort rollback so a failed swap never leaves an
+                # interface stuck under "$tmp_name" (L-new3). Each branch
+                # undoes exactly the renames that succeeded before the
+                # failing step; the two bare "downs" (steps 1-2) need no
+                # undo since no name changed yet.
+                case "$swap_step" in
+                    3)
+                        can_run_bounded "$timeout" "$ip_cmd" link set "$tmp_name" name "$want" >/dev/null 2>&1 || true
+                        ;;
+                    4)
+                        can_run_bounded "$timeout" "$ip_cmd" link set "$want" name "$current" >/dev/null 2>&1 || true
+                        can_run_bounded "$timeout" "$ip_cmd" link set "$tmp_name" name "$want" >/dev/null 2>&1 || true
+                        ;;
+                    *)
+                        : # steps 0-2: nothing renamed yet, nothing to undo
+                        ;;
+                esac
                 rename_failed=1
             fi
             ;;
         *)
-            # Missing netdev (never appeared within the 10s wait above) or
-            # the down/rename ip command itself failed.
-            can_log WARNING "iface=$spidev want=$want reason=pin_name_rc_$pin_rc"
-            missing_warned=1
+            # The netdev exists (checked above) but the down/rename `ip`
+            # call itself failed - a real operational failure, not a
+            # missing-hardware condition (L-new2).
+            can_log ERR "iface=$spidev want=$want reason=pin_name_op_failed_rc_$pin_rc"
+            rename_failed=1
             ;;
     esac
 done

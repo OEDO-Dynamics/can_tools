@@ -1,7 +1,19 @@
 #!/bin/bash
 # install.sh - Install can_tools to /opt/can_tools (idempotent, root).
 #
-# Usage: sudo ./install.sh [--check]
+# Usage: sudo ./install.sh [--check] [--plus]
+#
+#   --plus   also install and enable the canhat_plus_* units (HAT+ hardware).
+#            Without it, the canhat_plus_* scripts are still copied to
+#            /opt/can_tools (harmless, never run on their own), but the
+#            units are neither installed nor enabled - §4-3 only lists
+#            canhat_fd_rename/setup and (once it exists) can_watchdog as
+#            install/enable targets; canhat_plus_* is explicitly "do not
+#            change the behavior" (§2b), and enabling it unconditionally on
+#            every machine would let it race/override the FD setup on a
+#            boot where its ordering (After=network.target only - no lock,
+#            no After=/Before= relationship with canhat_fd_*) lets it run
+#            concurrently with or after canhat_fd_setup.service.
 #
 # Environment variables (mainly for testing against a scratch tree instead of
 # the real filesystem):
@@ -15,6 +27,7 @@
 #   CAN_TOOLS_STATE_DIR      - /var/lib/can_tools equivalent (default: /var/lib/can_tools)
 #   CAN_TOOLS_SYSTEMCTL_CMD - systemctl replacement (default: systemctl)
 #   CHECK_MODE                  - if 1 (or --check given), show diffs and make no changes
+#   CAN_TOOLS_INSTALL_PLUS - if 1 (or --plus given), also install/enable canhat_plus_*
 #   VERBOSE                      - if 1, also log unchanged files
 
 set -euo pipefail
@@ -22,13 +35,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
-# --check is accepted as an argument (§4); CHECK_MODE=1 in the environment
-# still works too, for scripted callers.
+# --check and --plus are accepted as arguments (§4); CHECK_MODE=1 /
+# CAN_TOOLS_INSTALL_PLUS=1 in the environment still work too, for scripted
+# callers.
 CHECK_MODE="${CHECK_MODE:-0}"
+PLUS_MODE="${CAN_TOOLS_INSTALL_PLUS:-0}"
 for arg in "$@"; do
-    [[ "$arg" == "--check" ]] && CHECK_MODE=1
+    case "$arg" in
+        --check) CHECK_MODE=1 ;;
+        --plus) PLUS_MODE=1 ;;
+    esac
 done
 readonly CHECK_MODE
+readonly PLUS_MODE
 
 # Configuration from environment (for testing)
 readonly INSTALL_ROOT="${INSTALL_ROOT:-/}"
@@ -153,8 +172,22 @@ _install_unit() {
 # Stop, disable and remove the legacy can_monitor unit/links/files (§4-4,
 # H2). can_monitor itself triggered the 2026-10-14 incident; it is never
 # installed by this script. /var/log/can_monitor.log is left alone.
+# Bounded wait for a unit to report inactive (M-new2). Checks at least once
+# even with timeout 0. Returns 0 once inactive, 1 on timeout.
+_wait_inactive() {
+    local unit="$1" timeout_s="$2"
+    local max_ticks=$(( timeout_s * 10 )) ticks=0
+    while :; do
+        "$SYSTEMCTL_CMD" is-active "$unit" >/dev/null 2>&1 || return 0
+        (( ticks >= max_ticks )) && return 1
+        sleep 0.1
+        (( ticks++ ))
+    done
+}
+
 _remove_can_monitor() {
     local did_change=1
+    local monitor_stop_timeout="${CAN_TOOLS_MONITOR_STOP_TIMEOUT_S:-15}"
 
     for unit in can_monitor.timer can_monitor.service; do
         local dst="$SYSTEMD_DIR/$unit"
@@ -166,8 +199,20 @@ _remove_can_monitor() {
             continue
         fi
 
-        _log "INFO" "Stopping and disabling legacy unit: $unit"
-        "$SYSTEMCTL_CMD" stop "$unit" >/dev/null 2>&1 || true
+        if [[ "$unit" == "can_monitor.service" ]]; then
+            # M-new2: can_monitor.service is a oneshot that itself runs
+            # `ip link set down; sleep 0.5; up`. A plain `systemctl stop`
+            # sends SIGTERM mid-run and can leave the interface down. Wait
+            # (bounded) for it to finish on its own instead - never send it
+            # a stop.
+            _log "INFO" "Disabling legacy unit: $unit (waiting up to ${monitor_stop_timeout}s for it to finish, never stopping it)"
+            if ! _wait_inactive "$unit" "$monitor_stop_timeout"; then
+                _log "WARN" "$unit did not become inactive within ${monitor_stop_timeout}s; disabling/removing it anyway without stopping it"
+            fi
+        else
+            _log "INFO" "Stopping and disabling legacy unit: $unit"
+            "$SYSTEMCTL_CMD" stop "$unit" >/dev/null 2>&1 || true
+        fi
         "$SYSTEMCTL_CMD" disable "$unit" >/dev/null 2>&1 || true
         rm -f "$dst"
     done
@@ -293,13 +338,23 @@ main() {
     # Systemd units (§4-3): copied, never symlinked; replaces any pre-A2
     # link-unit deployment (M1). can_watchdog.service does not exist yet in
     # this PR (PR-B) - installed automatically once it does.
+    #
+    # canhat_plus_* is deliberately NOT in the default list (C-new1): §4-3
+    # names only canhat_fd_rename/setup and can_watchdog as install/enable
+    # targets, and canhat_plus_setup.service has no After=/Before=/lock
+    # relationship with canhat_fd_setup.service - enabling it on every
+    # machine would let it race the FD setup (and overwrite txqueuelen
+    # 10/restart-ms 100 with its own 65536/1000) on any boot where both
+    # happen to be enabled. It is only added to the list with --plus, for a
+    # machine that is actually a HAT+ board.
     local units_to_install=(
         "canhat_fd_rename.service"
         "canhat_fd_setup.service"
-        "canhat_plus_rename.service"
-        "canhat_plus_setup.service"
         "can_watchdog.service"
     )
+    if (( PLUS_MODE )); then
+        units_to_install+=("canhat_plus_rename.service" "canhat_plus_setup.service")
+    fi
 
     for unit in "${units_to_install[@]}"; do
         if [[ ! -f "$SCRIPT_DIR/$unit" ]]; then
@@ -320,7 +375,20 @@ main() {
         diff_found=1
     fi
 
-    if (( ! CHECK_MODE )); then
+    if (( CHECK_MODE )); then
+        # L-new1: --check only compared file contents, so a unit that is
+        # installed but not enabled (e.g. a hand-disabled unit, or this
+        # being the first run before the real `systemctl enable` below ever
+        # happened) showed no diff. Report enable-state too, read-only
+        # (is-enabled makes no change).
+        for unit in "${units_to_install[@]}"; do
+            [[ -f "$SCRIPT_DIR/$unit" ]] || continue
+            if ! "$SYSTEMCTL_CMD" is-enabled "$unit" >/dev/null 2>&1; then
+                _log "DIFF" "Would enable: $unit"
+                diff_found=1
+            fi
+        done
+    else
         # M2/M4: a single daemon-reload (via the replaceable systemctl
         # command), then enable every unit this script manages. Enabling an
         # already-enabled unit is a no-op; none of this starts/restarts

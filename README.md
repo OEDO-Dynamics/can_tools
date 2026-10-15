@@ -16,16 +16,17 @@
 ### Quick Install
 
 ```bash
-git clone --recursive https://github.com/RyodoTanaka/can_tools.git
+git clone --recursive https://github.com/OEDO-Dynamics/can_tools.git
 cd can_tools
 sudo ./install.sh
 ```
 
-This installs can_tools to `/opt/can_tools`, copies the `canhat_fd_*` /
-`canhat_plus_*` systemd units into `/etc/systemd/system`, enables them, and
-creates `/run/can_tools` and `/var/lib/can_tools` (plus a `tmpfiles.d`
-drop-in so they survive a reboot). It is **idempotent** and
-**non-destructive**:
+This installs can_tools to `/opt/can_tools`, copies the `canhat_fd_rename`/
+`canhat_fd_setup` systemd units into `/etc/systemd/system` and enables them,
+and creates `/run/can_tools` and `/var/lib/can_tools` (plus a `tmpfiles.d`
+drop-in so they survive a reboot). `canhat_plus_*` (CAN HAT **Plus**
+hardware) is **not** installed/enabled by default - see "CAN HAT Plus"
+below. It is **idempotent** and **non-destructive**:
 - Files are only written if their contents changed.
 - Existing configuration (`/opt/can_tools/can_tools.conf`) is never
   overwritten; `install.sh` creates it (empty) only on first install, and
@@ -84,20 +85,27 @@ the previously-applied settings.
 
 ### Systemd Services
 
-`install.sh` already installs and enables these units; they are started by
-systemd itself at boot (`WantedBy=multi-user.target`). Use `systemctl
-status`/`journalctl -u` to check them - don't `systemctl start`/`restart`
-them manually on a live machine (see above).
-
-**CAN HAT FD** (supports CAN FD at 2 Mbps data rate):
+**CAN HAT FD** (supports CAN FD at 2 Mbps data rate): `install.sh` already
+installs and enables these units; they are started by systemd itself at boot
+(`WantedBy=multi-user.target`). Use `systemctl status`/`journalctl -u` to
+check them - don't `systemctl start`/`restart` them manually on a live
+machine (see above).
 ```bash
 sudo systemctl status canhat_fd_rename.service canhat_fd_setup.service
 ```
 
-**CAN HAT Plus** (standard CAN only):
+**CAN HAT Plus** (standard CAN only, different hardware from CAN HAT FD):
+`install.sh` copies the `canhat_plus_*` scripts to `/opt/can_tools` but does
+**not** install or enable the `canhat_plus_*` units by default, since they
+have no ordering or locking relationship with `canhat_fd_setup.service` and
+would race it (and overwrite its `txqueuelen`/`restart-ms`) if both ended up
+enabled on the same machine. On an actual CAN HAT Plus board, either run:
 ```bash
+sudo ./install.sh --plus
 sudo systemctl status canhat_plus_rename.service canhat_plus_setup.service
 ```
+or bring the interfaces up manually/once at boot via `enable_canhat_plus.sh`
+without installing a unit at all.
 
 ## CAN Interface Setup
 

@@ -118,6 +118,78 @@ grep -q "^<4>" "$tmpdir/rename3.log"
 check $? "rename should log a WARNING (priority 4) about the missing interface: $(cat "$tmpdir/rename3.log")"
 
 # ---------------------------------------------------------------------
+# L-new2: can_pin_name returns rc=1 both for "no netdev" and for "the netdev
+# exists but the ip down/rename call itself failed". Those must be told
+# apart at the call site: a present-but-failing-to-rename interface is a
+# real operational failure (exit 1, ERROR), not the L4 "missing hardware"
+# case (exit 0, WARNING).
+# ---------------------------------------------------------------------
+echo "Testing canhat_fd_rename.bash: present interface, ip rename failure (L-new2)"
+sysfs_l2="$tmpdir/sysfs_l2" fake_l2="$tmpdir/fake_l2"
+_setup_fake_devices "$sysfs_l2" "$fake_l2" spi0.0 can0
+conf_l2="$tmpdir/l2.conf"
+echo "CAN_SPI_MAP=spi0.0:can7" >"$conf_l2"
+mkdir -p "$fake_l2/fail"
+touch "$fake_l2/fail/ip"
+
+run_rename "$sysfs_l2" "$fake_l2" "$conf_l2" >"$tmpdir/rename_l2.log" 2>&1
+rc=$?
+(( rc == 1 )); check $? "rename must exit 1 when the netdev is present but the ip rename call fails (L-new2), got $rc: $(cat "$tmpdir/rename_l2.log")"
+grep -q "^<3>" "$tmpdir/rename_l2.log"
+check $? "rename should log an ERROR (priority 3), not a WARNING, for an operational failure: $(cat "$tmpdir/rename_l2.log")"
+
+# ---------------------------------------------------------------------
+# L-new3: a swap that fails partway must roll back, never leaving an
+# interface named "can_tmp_<pid>".
+# ---------------------------------------------------------------------
+echo "Testing canhat_fd_rename.bash: mid-swap failure is rolled back (L-new3)"
+sysfs_l3="$tmpdir/sysfs_l3" fake_l3="$tmpdir/fake_l3"
+_setup_fake_devices "$sysfs_l3" "$fake_l3" spi0.0 can1 spi1.0 can0
+
+# A flaky `ip` that delegates to tests/fakes/ip for every call except the
+# $FLAKY_FAIL_ON'th, which it fails without touching sysfs - simulating the
+# 4th call in the swap chain (down current, down want, rename want->tmp,
+# rename current->want [FAILS HERE], rename tmp->current) failing.
+flaky_ip="$tmpdir/flaky_ip_l3"
+cat >"$flaky_ip" <<EOF
+#!/bin/bash
+fake_dir="\${CAN_TOOLS_FAKE_DIR:-.}"
+count_file="\$fake_dir/.flaky_call_count"
+n=0
+[[ -f "\$count_file" ]] && n=\$(cat "\$count_file")
+n=\$((n + 1))
+echo "\$n" >"\$count_file"
+if [[ "\$n" == "\${FLAKY_FAIL_ON:-0}" ]]; then
+    echo "\$@" >>"\$fake_dir/calls.log"
+    exit 1
+fi
+exec "$fakes_dir/ip" "\$@"
+EOF
+chmod +x "$flaky_ip"
+
+env -i PATH="/usr/bin:/bin" \
+    CAN_TOOLS_SYSFS_ROOT="$sysfs_l3" \
+    CAN_TOOLS_IP_CMD="$flaky_ip" \
+    CAN_TOOLS_FAKE_DIR="$fake_l3" \
+    CAN_TOOLS_RUN_DIR="$fake_l3/run" \
+    CAN_TOOLS_CONF="$empty_conf" \
+    WD_RTNL_TIMEOUT_S=2 \
+    FLAKY_FAIL_ON=4 \
+    bash "$repo_root/canhat_fd_rename.bash" >"$tmpdir/rename_l3.log" 2>&1
+rc=$?
+(( rc == 1 )); check $? "rename must exit 1 when a swap fails partway, got $rc: $(cat "$tmpdir/rename_l3.log")"
+
+tmp_leftover=0
+for d in "$sysfs_l3/class/net"/can_tmp_*; do
+    [[ -e "$d" ]] && tmp_leftover=1
+done
+if (( tmp_leftover == 0 )); then rc=0; else rc=1; fi
+check "$rc" "a failed swap must not leave any interface named can_tmp_<pid> (L-new3): $(ls "$sysfs_l3/class/net" 2>/dev/null)"
+
+if [[ -d "$sysfs_l3/class/net/can0" && -d "$sysfs_l3/class/net/can1" ]]; then rc=0; else rc=1; fi
+check "$rc" "after rollback, both original names (can0, can1) should still exist, just not swapped yet"
+
+# ---------------------------------------------------------------------
 # H3: canhat_fd_setup.bash must only touch the interface given as $1.
 # ---------------------------------------------------------------------
 echo "Testing canhat_fd_setup.bash: only touches \$1 (H3)"

@@ -23,12 +23,12 @@ check() {
 # Every call below runs the real install.sh, pointed entirely at a scratch
 # tree via env vars - no sudo, no real /opt or /etc touched.
 #
-# CAN_TOOLS_MONITOR_STOP_TIMEOUT_S=0: tests/fakes/systemctl always exits 0
-# for `is-active` (it does not model active/inactive), so the M-new2
-# wait-for-inactive loop would otherwise always run to its full timeout.
-# Forcing it to 0 keeps the one is-active check (proving the code path runs)
-# without a real wait; it is still never a `stop`, which is the property
-# M-new2 cares about.
+# CAN_TOOLS_MONITOR_STOP_TIMEOUT_S=0: belt-and-suspenders against a slow
+# test - `_wait_inactive` reads `systemctl show -p ActiveState --value`,
+# which tests/fakes/systemctl doesn't model (empty stdout), so it already
+# falls through to "not activating" and returns immediately without
+# sleeping; forcing the timeout to 0 just makes that explicit. It is still
+# never a `stop`, which is the property M-new2 cares about.
 run_install() {
     local opt="$1" systemd="$2" tmpfiles="$3" run="$4" state="$5" fake="$6"
     shift 6
@@ -185,8 +185,8 @@ check $? "can_monitor.timer should be disabled before removal"
 # it a stop (which could land mid-down/up and leave the interface down).
 if ! grep -q "^stop can_monitor.service$" "$s4/fake/calls.log"; then rc=0; else rc=1; fi
 check "$rc" "can_monitor.service must NEVER be sent a stop (M-new2): $(cat "$s4/fake/calls.log")"
-grep -q "^is-active can_monitor.service$" "$s4/fake/calls.log"
-check $? "can_monitor.service should be polled with is-active before disabling it (M-new2)"
+grep -q "^show -p ActiveState --value can_monitor.service$" "$s4/fake/calls.log"
+check $? "can_monitor.service's ActiveState should be polled before disabling it (M-new2/L-r3a)"
 grep -q "^disable can_monitor.service$" "$s4/fake/calls.log"
 check $? "can_monitor.service should still be disabled"
 
@@ -213,42 +213,41 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Scenario 6 (C-new1): canhat_plus_* units must never be installed/enabled
-# by default - only canhat_fd_rename/setup (and, once it exists,
-# can_watchdog) are §4-3's install/enable targets. canhat_plus_setup.service
-# has no After=/Before=/lock relationship with canhat_fd_setup.service, so
-# enabling it unconditionally on an FD machine would let it race the FD
-# setup and overwrite its txqueuelen/restart-ms. --plus opts in explicitly.
+# Scenario 6 (C-new1/M-r3): canhat_plus_* units must NEVER be installed or
+# enabled by this script, under any invocation - §4-3 only lists
+# canhat_fd_rename/setup and (once it exists) can_watchdog as install/enable
+# targets, and canhat_plus_setup.service has no After=/Before=/lock
+# relationship with canhat_fd_setup.service, so enabling both on one
+# machine lets them race (an earlier --plus flag that installed+enabled
+# both side by side was removed for exactly this reason - M-r3). HAT+ is
+# out of scope for Issue #9 §2b; it has no flag here at all, not even a
+# no-op one, so a stray "--plus" on the command line is just an unrecognized
+# argument (ignored, like any other).
 # ---------------------------------------------------------------------
-echo "Scenario 6: canhat_plus_* is never installed/enabled without --plus (C-new1)"
-s6="$tmpdir/s6"
-mkdir -p "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake"
+echo "Scenario 6: canhat_plus_* is never installed or enabled, under any invocation (C-new1/M-r3)"
+for extra_arg in "" "--plus" "--check"; do
+    s6="$tmpdir/s6_${extra_arg:-none}"
+    mkdir -p "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake"
 
-run_install "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake" >/dev/null 2>&1
-rc=$?
-(( rc == 0 )); check $? "plain install should still succeed"
+    if [[ -n "$extra_arg" ]]; then
+        run_install "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake" "$extra_arg" >/dev/null 2>&1
+    else
+        run_install "$s6/opt" "$s6/systemd" "$s6/tmpfiles" "$s6/run" "$s6/state" "$s6/fake" >/dev/null 2>&1
+    fi
 
-if [[ ! -e "$s6/systemd/canhat_plus_setup.service" ]]; then rc=0; else rc=1; fi
-check "$rc" "canhat_plus_setup.service must not be installed by default (C-new1)"
-if [[ ! -e "$s6/systemd/canhat_plus_rename.service" ]]; then rc=0; else rc=1; fi
-check "$rc" "canhat_plus_rename.service must not be installed by default (C-new1)"
-if ! grep -qi "canhat_plus" "$s6/fake/calls.log" 2>/dev/null; then rc=0; else rc=1; fi
-check "$rc" "systemctl must never be told to enable canhat_plus_* without --plus (C-new1): $(cat "$s6/fake/calls.log" 2>/dev/null)"
-if [[ -f "$s6/opt/can_tools/canhat_plus_setup.bash" ]]; then rc=0; else rc=1; fi
+    if [[ ! -e "$s6/systemd/canhat_plus_setup.service" ]]; then rc=0; else rc=1; fi
+    check "$rc" "canhat_plus_setup.service must never be installed (invocation: install.sh $extra_arg) (C-new1/M-r3)"
+    if [[ ! -e "$s6/systemd/canhat_plus_rename.service" ]]; then rc=0; else rc=1; fi
+    check "$rc" "canhat_plus_rename.service must never be installed (invocation: install.sh $extra_arg) (C-new1/M-r3)"
+    if ! grep -qi "canhat_plus" "$s6/fake/calls.log" 2>/dev/null; then rc=0; else rc=1; fi
+    check "$rc" "systemctl must never be told about canhat_plus_* (invocation: install.sh $extra_arg) (C-new1/M-r3): $(cat "$s6/fake/calls.log" 2>/dev/null)"
+done
+
+s6c="$tmpdir/s6c"
+mkdir -p "$s6c/opt" "$s6c/systemd" "$s6c/tmpfiles" "$s6c/run" "$s6c/state" "$s6c/fake"
+run_install "$s6c/opt" "$s6c/systemd" "$s6c/tmpfiles" "$s6c/run" "$s6c/state" "$s6c/fake" >/dev/null 2>&1
+if [[ -f "$s6c/opt/can_tools/canhat_plus_setup.bash" ]]; then rc=0; else rc=1; fi
 check "$rc" "the canhat_plus_* scripts themselves are still copied (harmless, never run on their own)"
-
-# With --plus, the units ARE installed and enabled.
-s6b="$tmpdir/s6b"
-mkdir -p "$s6b/opt" "$s6b/systemd" "$s6b/tmpfiles" "$s6b/run" "$s6b/state" "$s6b/fake"
-run_install "$s6b/opt" "$s6b/systemd" "$s6b/tmpfiles" "$s6b/run" "$s6b/state" "$s6b/fake" --plus >/dev/null 2>&1
-rc=$?
-(( rc == 0 )); check $? "--plus install should succeed"
-if [[ -f "$s6b/systemd/canhat_plus_setup.service" ]]; then rc=0; else rc=1; fi
-check "$rc" "--plus should install canhat_plus_setup.service"
-grep -q "^enable canhat_plus_setup.service$" "$s6b/fake/calls.log"
-check $? "--plus should enable canhat_plus_setup.service"
-grep -q "^enable canhat_plus_rename.service$" "$s6b/fake/calls.log"
-check $? "--plus should enable canhat_plus_rename.service"
 
 # ---------------------------------------------------------------------
 # Scenario 7 (L-new1): --check should also flag a unit that is installed

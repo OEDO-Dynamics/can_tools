@@ -1,19 +1,18 @@
 #!/bin/bash
 # install.sh - Install can_tools to /opt/can_tools (idempotent, root).
 #
-# Usage: sudo ./install.sh [--check] [--plus]
+# Usage: sudo ./install.sh [--check]
 #
-#   --plus   also install and enable the canhat_plus_* units (HAT+ hardware).
-#            Without it, the canhat_plus_* scripts are still copied to
-#            /opt/can_tools (harmless, never run on their own), but the
-#            units are neither installed nor enabled - §4-3 only lists
-#            canhat_fd_rename/setup and (once it exists) can_watchdog as
-#            install/enable targets; canhat_plus_* is explicitly "do not
-#            change the behavior" (§2b), and enabling it unconditionally on
-#            every machine would let it race/override the FD setup on a
-#            boot where its ordering (After=network.target only - no lock,
-#            no After=/Before= relationship with canhat_fd_*) lets it run
-#            concurrently with or after canhat_fd_setup.service.
+# canhat_plus_* (CAN HAT+/MCP2515 hardware) is out of scope for Issue #9
+# §2b ("§2b では plus は対象外（動作を変えない）") and is never installed or
+# enabled by this script, under any flag - §4-3 only lists
+# canhat_fd_rename/setup and (once it exists) can_watchdog as install/enable
+# targets. A machine using CAN HAT+ hardware is set up manually; see the
+# README's "CAN HAT Plus" section. (An earlier draft of this script had a
+# --plus flag that installed+enabled canhat_plus_* *alongside* the FD units;
+# that still let them race/override each other whenever both ended up
+# enabled, so it was removed rather than fixed - HAT+ is simply not this
+# PR's concern.)
 #
 # Environment variables (mainly for testing against a scratch tree instead of
 # the real filesystem):
@@ -27,7 +26,6 @@
 #   CAN_TOOLS_STATE_DIR      - /var/lib/can_tools equivalent (default: /var/lib/can_tools)
 #   CAN_TOOLS_SYSTEMCTL_CMD - systemctl replacement (default: systemctl)
 #   CHECK_MODE                  - if 1 (or --check given), show diffs and make no changes
-#   CAN_TOOLS_INSTALL_PLUS - if 1 (or --plus given), also install/enable canhat_plus_*
 #   VERBOSE                      - if 1, also log unchanged files
 
 set -euo pipefail
@@ -35,19 +33,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
-# --check and --plus are accepted as arguments (§4); CHECK_MODE=1 /
-# CAN_TOOLS_INSTALL_PLUS=1 in the environment still work too, for scripted
-# callers.
+# --check is accepted as an argument (§4); CHECK_MODE=1 in the environment
+# still works too, for scripted callers.
 CHECK_MODE="${CHECK_MODE:-0}"
-PLUS_MODE="${CAN_TOOLS_INSTALL_PLUS:-0}"
 for arg in "$@"; do
     case "$arg" in
         --check) CHECK_MODE=1 ;;
-        --plus) PLUS_MODE=1 ;;
     esac
 done
 readonly CHECK_MODE
-readonly PLUS_MODE
 
 # Configuration from environment (for testing)
 readonly INSTALL_ROOT="${INSTALL_ROOT:-/}"
@@ -172,13 +166,25 @@ _install_unit() {
 # Stop, disable and remove the legacy can_monitor unit/links/files (§4-4,
 # H2). can_monitor itself triggered the 2026-10-14 incident; it is never
 # installed by this script. /var/log/can_monitor.log is left alone.
-# Bounded wait for a unit to report inactive (M-new2). Checks at least once
-# even with timeout 0. Returns 0 once inactive, 1 on timeout.
+# Bounded wait for a unit to leave the activating/deactivating transition
+# (M-new2, refined per L-r3a). A plain `is-active` returns non-zero for
+# "activating" too (a oneshot that is still mid-run reports ActiveState
+# activating, not active, until it finishes), so checking its exit status
+# alone would return immediately even while the unit is still running.
+# ActiveState itself is what actually distinguishes "still running" from
+# "done" (inactive/failed) or "never existed" (unknown/empty). Checks at
+# least once even with timeout 0. Returns 0 once no longer
+# activating/deactivating, 1 on timeout.
 _wait_inactive() {
     local unit="$1" timeout_s="$2"
     local max_ticks=$(( timeout_s * 10 )) ticks=0
+    local state
     while :; do
-        "$SYSTEMCTL_CMD" is-active "$unit" >/dev/null 2>&1 || return 0
+        state=$("$SYSTEMCTL_CMD" show -p ActiveState --value "$unit" 2>/dev/null) || state=""
+        case "$state" in
+            activating|deactivating) : ;;
+            *) return 0 ;;
+        esac
         (( ticks >= max_ticks )) && return 1
         sleep 0.1
         (( ticks++ ))
@@ -339,22 +345,19 @@ main() {
     # link-unit deployment (M1). can_watchdog.service does not exist yet in
     # this PR (PR-B) - installed automatically once it does.
     #
-    # canhat_plus_* is deliberately NOT in the default list (C-new1): §4-3
-    # names only canhat_fd_rename/setup and can_watchdog as install/enable
-    # targets, and canhat_plus_setup.service has no After=/Before=/lock
-    # relationship with canhat_fd_setup.service - enabling it on every
-    # machine would let it race the FD setup (and overwrite txqueuelen
-    # 10/restart-ms 100 with its own 65536/1000) on any boot where both
-    # happen to be enabled. It is only added to the list with --plus, for a
-    # machine that is actually a HAT+ board.
+    # canhat_plus_* is NEVER in this list (C-new1/M-r3): §4-3 names only
+    # canhat_fd_rename/setup and can_watchdog as install/enable targets, and
+    # canhat_plus_setup.service has no After=/Before=/lock relationship with
+    # canhat_fd_setup.service - enabling both on the same machine lets them
+    # race (and overwrite each other's txqueuelen/restart-ms, or leave an
+    # interface down if the FD params are applied to HAT+/MCP2515 hardware).
+    # There is intentionally no flag to opt into installing it here - HAT+
+    # is out of scope for Issue #9 §2b; see the README for the manual setup.
     local units_to_install=(
         "canhat_fd_rename.service"
         "canhat_fd_setup.service"
         "can_watchdog.service"
     )
-    if (( PLUS_MODE )); then
-        units_to_install+=("canhat_plus_rename.service" "canhat_plus_setup.service")
-    fi
 
     for unit in "${units_to_install[@]}"; do
         if [[ ! -f "$SCRIPT_DIR/$unit" ]]; then

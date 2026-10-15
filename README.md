@@ -25,8 +25,9 @@ This installs can_tools to `/opt/can_tools`, copies the `canhat_fd_rename`/
 `canhat_fd_setup` systemd units into `/etc/systemd/system` and enables them,
 and creates `/run/can_tools` and `/var/lib/can_tools` (plus a `tmpfiles.d`
 drop-in so they survive a reboot). `canhat_plus_*` (CAN HAT **Plus**
-hardware) is **not** installed/enabled by default - see "CAN HAT Plus"
-below. It is **idempotent** and **non-destructive**:
+hardware) is never installed or enabled by `install.sh`, under any flag -
+see "CAN HAT Plus" below for the manual setup. It is **idempotent** and
+**non-destructive**:
 - Files are only written if their contents changed.
 - Existing configuration (`/opt/can_tools/can_tools.conf`) is never
   overwritten; `install.sh` creates it (empty) only on first install, and
@@ -94,18 +95,28 @@ machine (see above).
 sudo systemctl status canhat_fd_rename.service canhat_fd_setup.service
 ```
 
-**CAN HAT Plus** (standard CAN only, different hardware from CAN HAT FD):
-`install.sh` copies the `canhat_plus_*` scripts to `/opt/can_tools` but does
-**not** install or enable the `canhat_plus_*` units by default, since they
-have no ordering or locking relationship with `canhat_fd_setup.service` and
-would race it (and overwrite its `txqueuelen`/`restart-ms`) if both ended up
-enabled on the same machine. On an actual CAN HAT Plus board, either run:
+**CAN HAT Plus** (standard CAN only, different hardware from CAN HAT FD) is
+out of scope for `install.sh` - it is never installed or enabled, under any
+flag. `canhat_plus_*` has no ordering or locking relationship with
+`canhat_fd_setup.service`, so enabling both on the same machine lets them
+race each other (and overwrite each other's `txqueuelen`/`restart-ms`, or
+leave an interface down if the FD parameters land on CAN HAT Plus/MCP2515
+hardware, which doesn't support CAN FD). On an actual CAN HAT Plus machine,
+set it up by hand instead:
 ```bash
-sudo ./install.sh --plus
-sudo systemctl status canhat_plus_rename.service canhat_plus_setup.service
+# Make sure the FD units are not also enabled on this machine:
+sudo systemctl disable canhat_fd_rename.service canhat_fd_setup.service
+
+# Install the plus units yourself (install.sh never does this):
+sudo cp canhat_plus_rename.service canhat_plus_setup.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now canhat_plus_rename.service canhat_plus_setup.service
 ```
-or bring the interfaces up manually/once at boot via `enable_canhat_plus.sh`
-without installing a unit at all.
+`canhat_plus_setup.bash`/`canhat_plus_rename.bash`/`enable_canhat_plus.sh`
+are copied to `/opt/can_tools` by `install.sh` regardless (harmless - they
+are never run unless a unit or you invoke them). Note that `can_watchdog`
+(once it exists) is FD-only for now - it is not meant to run on a CAN HAT
+Plus machine.
 
 ## CAN Interface Setup
 

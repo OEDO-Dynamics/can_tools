@@ -323,11 +323,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         exit 1
     fi
 
-    # can_now() reads this var without a ":-" default; under `set -u` an
-    # unset (never exported) var trips "unbound variable". Give it a default
-    # here rather than in the lib (lib is out of scope for this change).
-    : "${CAN_TOOLS_FAKE_TIME_FILE:=}"
-
     # Globals read/written by _diag_release()/cleanup().
     _pause_file=""
     _pre_existing_pause=""

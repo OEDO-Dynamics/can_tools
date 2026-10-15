@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# tests/fakes/journalctl - Fake journalctl for testing
+
+fake_dir="${CAN_TOOLS_FAKE_DIR:-.}"
+
+# Log the call
+echo "$@" >> "$fake_dir/calls.log" 2>/dev/null || true
+
+# Output kmsg if requested
+if [[ -f "$fake_dir/kmsg.txt" ]]; then
+    cat "$fake_dir/kmsg.txt"
+fi
+
+exit 0

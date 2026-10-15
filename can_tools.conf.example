@@ -1,0 +1,63 @@
+# can_tools.conf - CAN interface configuration
+#
+# This file is optional. Write only the keys you want to override from defaults.
+# Format: KEY=VALUE (no spaces around =)
+# All defaults are defined in can_tools_lib.bash
+#
+# Install script will place a blank version of this file on first install
+# and will not overwrite it on subsequent runs.
+#
+# Do NOT use quotes around values:
+#   Wrong:  CAN_IFACES="can0 can1"
+#   Right:  CAN_IFACES=can0 can1
+#
+# Validation:
+# - Numeric keys (CAN_BITRATE, etc): must be digits only
+# - Boolean keys (CAN_BERR_REPORTING, CAN_FD): must be "on" or "off"
+# - List keys (CAN_IFACES, CAN_DEPENDENT_UNITS): space-separated values
+# Invalid values are rejected and defaults are used instead (with WARNING logged)
+
+# --- CAN Interface Setup ---
+# CAN_IFACES=can0 can1
+# CAN_SPI_MAP=spi0.0:can0 spi1.0:can1
+# CAN_BITRATE=250000
+# CAN_RESTART_MS=100
+# CAN_BERR_REPORTING=off
+# CAN_FD=on
+# CAN_DBITRATE=2000000
+# CAN_TXQUEUELEN=10
+
+# --- Dependent Units ---
+# List of systemd units or docker containers to restart after rebind.
+# Format: space-separated list (no quotes)
+# Example: CAN_DEPENDENT_UNITS=myservice docker:mycontainer
+# CAN_DEPENDENT_UNITS=
+
+# --- TX Flush ---
+# Interfaces to flush on ERROR-PASSIVE (typically send-only ifaces)
+# CAN_FLUSH_IFACES=can0
+
+# --- Watchdog Parameters ---
+# WD_LOOP_S=1
+# WD_STALE_TX_FLUSH_S=2
+# WD_FLUSH_BACKOFF_MAX_S=30
+# WD_SETTLE_SAMPLE_MS=100
+# WD_SETTLE_MAX_MS=2000
+# WD_BUSOFF_QUIET_S=10
+# WD_BUSOFF_BACKOFF_MAX_S=30
+# WD_STORM_COUNT=5
+# WD_STORM_WINDOW_S=60
+# WD_STALL_CONSEC=3
+# WD_STALL_POST_BUSOFF_CONSEC=2
+# WD_STALL_POST_BUSOFF_WINDOW_S=5
+# WD_STALL_VERIFY_S=10
+# WD_RTNL_TIMEOUT_S=5
+# WD_REBIND_TIMEOUT_S=10
+# WD_REBIND_MAX_PER_HOUR=3
+# WD_RTNL_HUNG_CONSEC=3
+# WD_PAUSE_DEFAULT_MIN=30
+# WD_PAUSE_WARN_S=600
+# WD_DEGRADED_CRIT_S=600
+# WD_LOG_SUMMARY_S=60
+# WD_LOG_RATE_S=10
+# WD_CRASH_KEEP=5

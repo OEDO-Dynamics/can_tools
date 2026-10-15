@@ -20,8 +20,9 @@ if ! [[ "$diag_duration" =~ ^[0-9]+$ ]] || (( diag_duration > DIAG_DURATION_MAX 
     exit 1
 fi
 
-# Source lib for can_lock, can_pause, can_unpause, can_read_stats, can_log, can_now
-# (If lib is not available, use inline flock/pause file writes as fallback per Issue spec)
+# Source lib for can_lock, can_pause, can_unpause, can_log
+# can_diag.sh MUST use the same lock and pause mechanisms as the watchdog
+# to ensure mutual exclusion. Divergent implementations would break synchronization.
 if [[ -f "$(dirname "$0")/can_tools_lib.bash" ]]; then
     # shellcheck source=/dev/null
     source "$(dirname "$0")/can_tools_lib.bash"
@@ -29,40 +30,8 @@ elif [[ -f "/opt/can_tools/can_tools_lib.bash" ]]; then
     # shellcheck source=/dev/null
     source /opt/can_tools/can_tools_lib.bash
 else
-    # Fallback: minimal flock/pause implementation (before A1 merge)
-    _lib_available=0
-
-    can_lock() {
-        local timeout="${1:-5}"
-        mkdir -p "${CAN_TOOLS_RUN_DIR:-/run/can_tools}" 2>/dev/null || true
-        exec 9>"${CAN_TOOLS_RUN_DIR:-/run/can_tools}/lock"
-        flock -w "$timeout" 9 2>/dev/null
-    }
-
-    can_unlock() {
-        exec 9>&-
-    }
-
-    can_pause() {
-        local min="${1:-30}"
-        local run_dir="${CAN_TOOLS_RUN_DIR:-/run/can_tools}"
-        mkdir -p "$run_dir" 2>/dev/null || true
-        local now deadline
-        now=$(date +%s)
-        deadline=$((now + min * 60))
-        echo "$deadline" >"$run_dir/watchdog.pause" 2>/dev/null
-    }
-
-    can_unpause() {
-        local run_dir="${CAN_TOOLS_RUN_DIR:-/run/can_tools}"
-        rm -f "$run_dir/watchdog.pause" 2>/dev/null
-    }
-
-    can_log() {
-        local prio="$1"
-        shift
-        echo "[can_diag] prio=$prio $*" >&2
-    }
+    echo "ERROR: can_tools_lib.bash not found (required for lock/pause)" >&2
+    exit 1
 fi
 
 # Trap to restore settings on exit

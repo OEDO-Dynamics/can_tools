@@ -24,8 +24,10 @@ export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
 
 fakes_path=$(cd "$(dirname "$0")/fakes" && pwd) || exit 1
 export CAN_TOOLS_IP_CMD="$fakes_path/ip"
-export CAN_TOOLS_CANDUMP_CMD="$fakes_path/candump"
 export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+
+diag_fakes_path=$(cd "$(dirname "$0")/diag_fakes" && pwd) || exit 1
+export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
 
 mkdir -p "$tmpdir/run" "$tmpdir/fake" "$tmpdir/fake/can0" "$tmpdir/fake/can1"
 

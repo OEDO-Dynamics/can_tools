@@ -133,6 +133,39 @@ can_unlock
 timeout 1 bash -c 'flock -w 1 9 2>/dev/null' 9>"$tmpdir/run/lock" 2>/dev/null
 if [[ $? -eq 0 ]]; then check 0 "lock should be acquirable by another process once released"; else check 1 "lock should be acquirable by another process once released"; fi
 
+# ========== _can_is_alive tests (H4 CPU: now fork-free, builtin `read` +
+# parameter expansion instead of `awk`) ==========
+echo "Testing _can_is_alive..."
+
+# alive: a real, running process (this shell itself).
+_can_is_alive "$$"
+check $? "_can_is_alive should report the current shell (a running process) as alive"
+
+# nonexistent: a pid that (almost certainly) does not exist. can_run_bounded's
+# hang tests below additionally cover the "was alive, got killed, becomes not
+# alive" transition once the kernel actually reaps it -- that's the semantics
+# that matter operationally (R2's hung-child guard).
+_can_is_alive 999999
+if [[ $? -ne 0 ]]; then check 0 "_can_is_alive should report a nonexistent pid as not alive"; else check 1 "_can_is_alive should report a nonexistent pid as not alive"; fi
+
+# A genuine Z (zombie) /proc/<pid>/stat line was found to be non-deterministic
+# to produce in this sandbox (an aggressive subreaper appears to collect
+# zombies before they can be observed even when the immediate parent never
+# calls wait()), so it is not exercised as a live OS zombie here. Instead,
+# exercise the exact field-extraction this function relies on -- "last ')'
+# then the next field is STATE" -- against a synthetic line shaped like a
+# real zombie's, including a comm containing a space and a ')' (the case a
+# naive `awk '{print $3}'` or whitespace-split would get wrong):
+synthetic_zombie_line="12345 (my w)eird) proc) Z 1 12345 12345 0 -1 ..."
+after="${synthetic_zombie_line##*) }"
+state="${after%% *}"
+if [[ "$state" == "Z" ]]; then check 0 "field-extraction logic must read STATE as Z from a comm containing spaces/parens, got: $state"; else check 1 "field-extraction logic must read STATE as Z from a comm containing spaces/parens, got: $state"; fi
+
+synthetic_running_line="12345 (sleep) S 1 12345 12345 0 -1 ..."
+after="${synthetic_running_line##*) }"
+state="${after%% *}"
+if [[ "$state" == "S" ]]; then check 0 "field-extraction logic must read STATE as S (not Z) for a running process, got: $state"; else check 1 "field-extraction logic must read STATE as S (not Z) for a running process, got: $state"; fi
+
 # ========== can_run_bounded tests ==========
 echo "Testing can_run_bounded..."
 

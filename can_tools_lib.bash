@@ -5,6 +5,21 @@
 # can_tools_lib.bash - Library for CAN interface management
 # Provides configuration, locking, and CAN interface control functions.
 # This file is sourced, not executed. Does not call exit().
+#
+# Call convention (errexit safety, §2b addendum): every function in this file
+# is safe to source and call under a caller's `set -euo pipefail` WITHOUT
+# itself aborting mid-body on a normal, expected failure branch (e.g. an
+# interface that doesn't exist yet, a name collision, a bounded command that
+# times out). A function's own non-zero return value is still the CALLER's
+# responsibility to check -- this file does not change what each function
+# returns, only guarantees it reaches a `return` instead of dying partway
+# through on an internal statement. Because of that, call a function that can
+# return non-zero on its own (anything other than can_log/can_now) inside an
+# `if`/`||`/`&&` so your *own* `set -e` does the right thing with ITS result:
+#     if can_lock 5; then ...; fi
+#     can_setup_iface can0 || handle_failure
+# A bare, unguarded call is fine too (bash does not abort on the call itself),
+# but then you must inspect "$?" yourself if you care about the outcome.
 
 # Default values for all configuration keys (§2a)
 declare -g CAN_IFACES="can0 can1"
@@ -46,13 +61,36 @@ declare -g WD_CRASH_KEEP=5
 # Internal state
 declare -g _CAN_LOCK_DEPTH=0
 declare -g CAN_RUN_BOUNDED_PID=""
+# Set by can_pin_name on every call (cleared on success) to let a caller tell
+# apart the reasons behind its rc=1 without changing the §2b return contract
+# (0/1/2). Not part of the contract itself -- an informational extra. One of:
+# "" (success / not yet called), "no_net_dir" (spidev has no net/ dir),
+# "no_iface" (net/ dir exists but is empty -- no netdev registered yet),
+# "timeout" (the `ip link show <want>` collision check hit WD_RTNL_TIMEOUT_S),
+# "ip_check_failed" (that same check failed for some other reason),
+# "ip_rename_failed" (the down/rename `ip` calls themselves failed).
+declare -g CAN_PIN_NAME_REASON=""
 
-# Helper to check if a process is alive (not zombie)
+# Helper to check if a process is alive (not zombie, L-b semantics).
+# can_run_bounded polls this every 0.1s while waiting on its child, so it
+# must not fork: no `awk`/`cat`/`ps`. `read` is a bash builtin, and a plain
+# `<` redirect on it does not fork a subshell either.
 _can_is_alive() {
     local pid="$1"
-    [[ -f "/proc/$pid/stat" ]] || return 1
-    local state
-    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null)
+    local stat_line=""
+    # Redirect stderr before the `<` so a vanished-pid ENOENT (process already
+    # reaped -- the common, expected case) is silently swallowed instead of
+    # printing "No such file or directory" to the real stderr: bash applies
+    # redirections left-to-right, so `2>/dev/null` must come first here.
+    if ! read -r stat_line 2>/dev/null <"/proc/$pid/stat"; then
+        return 1
+    fi
+    # /proc/<pid>/stat is "<pid> (<comm>) <state> ...". comm can itself
+    # contain spaces or ')', so anchor on the LAST ')' rather than splitting
+    # on whitespace from the start -- the state char is the field right
+    # after it.
+    local after="${stat_line##*) }"
+    local state="${after%% *}"
     [[ "$state" != "Z" ]]
 }
 
@@ -128,6 +166,8 @@ _can_validate_value() {
 # Configuration Reading (§2b)
 # can_read_conf [path]
 # N-M2: Validate name keys for character types
+# Always returns 0 (invalid values just fall back to defaults + a WARNING);
+# safe to call bare under the caller's `set -e`.
 can_read_conf() {
     local conf_path="${1:-${CAN_TOOLS_CONF:-/opt/can_tools/can_tools.conf}}"
 
@@ -198,19 +238,25 @@ _can_validate_names() {
 
 # Locking (§2b)
 # can_lock [timeout_s]
+# Reentrant. Returns 0 (lock held) / 1 (could not take it within timeout_s).
+# Call it inside if/|| under the caller's `set -e` -- see the file header.
 can_lock() {
     local timeout="${1:-5}"
 
     mkdir -p "${CAN_TOOLS_RUN_DIR:-/run/can_tools}" 2>/dev/null || true
 
     if (( _CAN_LOCK_DEPTH > 0 )); then
-        (( _CAN_LOCK_DEPTH++ ))
+        # N.B. plain `(( x++ ))` returns the PRE-increment value as the
+        # command's exit status; at depth 0 that is 0 -> exit 1 -> would
+        # abort a bare `can_lock` call under the caller's `set -e`. Use
+        # assignment form instead so this statement always succeeds.
+        _CAN_LOCK_DEPTH=$((_CAN_LOCK_DEPTH + 1))
         return 0
     fi
 
     if exec 9>"${CAN_TOOLS_RUN_DIR:-/run/can_tools}/lock"; then
         if flock -w "$timeout" 9 2>/dev/null; then
-            (( _CAN_LOCK_DEPTH++ ))
+            _CAN_LOCK_DEPTH=$((_CAN_LOCK_DEPTH + 1))
             return 0
         else
             exec 9>&-
@@ -222,12 +268,14 @@ can_lock() {
 }
 
 # can_unlock
+# Returns 0 (unlocked one level) / 1 (was not locked). See the file header
+# for the `set -e` call convention.
 can_unlock() {
     if (( _CAN_LOCK_DEPTH <= 0 )); then
         return 1
     fi
 
-    (( _CAN_LOCK_DEPTH-- ))
+    _CAN_LOCK_DEPTH=$((_CAN_LOCK_DEPTH - 1))
     if (( _CAN_LOCK_DEPTH == 0 )); then
         exec 9>&-
     fi
@@ -245,6 +293,9 @@ can_unlock() {
 # (R2). Capture output via file redirection: can_run_bounded ... >"$file"; then
 # read from "$file". Same applies to functions that call can_run_bounded:
 # can_iface_states, can_pin_name, can_setup_iface.
+# Returns the wrapped command's own exit code, or 124 on timeout / while a
+# previous bounded child is still alive (R2). Call it inside if/|| under the
+# caller's `set -e` -- see the file header.
 can_run_bounded() {
     local timeout="$1"
     shift
@@ -275,21 +326,27 @@ can_run_bounded() {
 
     while (( i < max )); do
         if ! _can_is_alive "$CAN_RUN_BOUNDED_PID"; then
-            # Process finished, get its exit code
-            wait "$CAN_RUN_BOUNDED_PID" 2>/dev/null
-            local ret=$?
+            # Process finished, get its exit code. `wait` itself exits with
+            # that (often non-zero) code, so it must not be a bare statement:
+            # under the caller's `set -e` a bare failing `wait` would abort
+            # can_run_bounded right here, before `ret` is even captured.
+            local ret=0
+            wait "$CAN_RUN_BOUNDED_PID" 2>/dev/null || ret=$?
             # Output was written to file, cat it if exists
             [[ -f "$outfile" ]] && cat "$outfile" && rm -f "$outfile"
             CAN_RUN_BOUNDED_PID=""
-            return $ret
+            return "$ret"
         fi
         sleep 0.1
-        (( i++ ))
+        # Plain `(( i++ ))` is the pre-increment value as exit status; at
+        # i=0 that's 0 -> exit 1 -> would abort this loop's first tick under
+        # the caller's `set -e`. Assignment form always succeeds.
+        i=$((i + 1))
     done
 
     # Timeout - child pid remains in CAN_RUN_BOUNDED_PID for caller to track
     # Don't wait for child, just return 124
-    rm -f "$outfile"
+    rm -f "$outfile" || true
     return 124
 }
 
@@ -307,6 +364,8 @@ can_run_bounded() {
 # function also avoids `< <(can_run_bounded ...)` / `$(can_run_bounded ...)`
 # for the exact same reason, reading the captured output from a plain file
 # redirect instead.
+# Returns 0 (found >=1 CAN iface) / 1 (none found) / 124 (the bounded `ip`
+# call timed out). Call it inside if/|| under the caller's `set -e`.
 can_iface_states() {
     # §2b regexes, verbatim:
     #   iface line:  ^[0-9]+: ([^:@]+)[:@] <([^>]*)>
@@ -322,15 +381,18 @@ can_iface_states() {
 
     # N-H1: plain redirection, NOT $( ) / < <( ) - runs in the current shell so
     # CAN_RUN_BOUNDED_PID set by can_run_bounded is preserved for the next call.
-    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can >"$outfile" 2>&1
-    local rc=$?
+    # A bare call here would abort under the caller's `set -e` whenever `ip`
+    # itself exits non-zero (e.g. no CAN ifaces at all) -- guard with `|| rc=$?`
+    # so we can inspect the timeout case below instead of dying mid-function.
+    local rc=0
+    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "${CAN_TOOLS_IP_CMD:-ip}" -d link show type can >"$outfile" 2>&1 || rc=$?
 
     if (( rc == 124 )); then
-        rm -f "$outfile"
+        rm -f "$outfile" || true
         return 124
     fi
 
-    local if_name if_state if_admin restart_ms berr fd ctrlmode flags
+    local if_name="" if_state="" if_admin="" restart_ms="" berr="" fd="" ctrlmode="" flags=""
     local found=0
 
     if [[ -f "$outfile" ]]; then
@@ -361,10 +423,13 @@ can_iface_states() {
                 [[ ",$ctrlmode," == *,FD,* ]] && fd="on"
 
                 echo "$if_name $if_state restart_ms=$restart_ms berr=$berr fd=$fd admin=$if_admin"
-                (( found++ ))
+                # Assignment form: plain `(( found++ ))` returns the
+                # pre-increment value as exit status, which is 0 (-> exit 1)
+                # on the very first match and would abort here under `set -e`.
+                found=$((found + 1))
             fi
         done < "$outfile"
-        rm -f "$outfile"
+        rm -f "$outfile" || true
     fi
 
     [[ $found -eq 0 ]] && return 1
@@ -373,6 +438,10 @@ can_iface_states() {
 
 # Statistics Reading (§2b)
 # can_read_stats <if>
+# Called once per iface per watchdog tick (WD_LOOP_S), so this avoids forking
+# `cat` per file -- `read` is a builtin; a plain `<` redirect on it forks
+# nothing. Always returns 0 once past the iface-exists check; safe to call
+# bare under the caller's `set -e`.
 can_read_stats() {
     local if="$1"
     local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-/sys}"
@@ -382,11 +451,15 @@ can_read_stats() {
 
     local rx_packets=0 tx_packets=0 rx_fifo=0 tx_fifo=0 ifindex=0
 
-    [[ -f "$base/statistics/rx_packets" ]] && rx_packets=$(cat "$base/statistics/rx_packets" 2>/dev/null)
-    [[ -f "$base/statistics/tx_packets" ]] && tx_packets=$(cat "$base/statistics/tx_packets" 2>/dev/null)
-    [[ -f "$base/statistics/rx_fifo_errors" ]] && rx_fifo=$(cat "$base/statistics/rx_fifo_errors" 2>/dev/null)
-    [[ -f "$base/statistics/tx_fifo_errors" ]] && tx_fifo=$(cat "$base/statistics/tx_fifo_errors" 2>/dev/null)
-    [[ -f "$base/ifindex" ]] && ifindex=$(cat "$base/ifindex" 2>/dev/null)
+    # `read`'s own failure (e.g. a file vanishing mid-read) just leaves the
+    # "=0" default above in place, same as the previous `cat`-on-missing-file
+    # behavior; `2>/dev/null` before `<` so that failure's stderr (if any)
+    # doesn't leak, matching _can_is_alive's reasoning.
+    [[ -f "$base/statistics/rx_packets" ]] && { read -r rx_packets 2>/dev/null <"$base/statistics/rx_packets" || true; }
+    [[ -f "$base/statistics/tx_packets" ]] && { read -r tx_packets 2>/dev/null <"$base/statistics/tx_packets" || true; }
+    [[ -f "$base/statistics/rx_fifo_errors" ]] && { read -r rx_fifo 2>/dev/null <"$base/statistics/rx_fifo_errors" || true; }
+    [[ -f "$base/statistics/tx_fifo_errors" ]] && { read -r tx_fifo 2>/dev/null <"$base/statistics/tx_fifo_errors" || true; }
+    [[ -f "$base/ifindex" ]] && { read -r ifindex 2>/dev/null <"$base/ifindex" || true; }
 
     echo "$rx_packets $tx_packets $rx_fifo $tx_fifo $ifindex"
     return 0
@@ -394,14 +467,17 @@ can_read_stats() {
 
 # SPI Device Mapping (§2b)
 # can_spidev_of <if>
+# Returns 0 (printed the spidev) / 1 (no device symlink). Safe to call bare.
 can_spidev_of() {
     local if="$1"
     local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-/sys}"
     local device_link="$sysfs_root/class/net/$if/device"
 
     if [[ -L "$device_link" ]]; then
-        local device_path
-        device_path=$(readlink -f "$device_link" 2>/dev/null)
+        local device_path=""
+        # Guard: a bare failing `readlink` (symlink vanishes mid-race) would
+        # otherwise abort here under the caller's `set -e`.
+        device_path=$(readlink -f "$device_link" 2>/dev/null) || true
         echo "${device_path##*/}"
         return 0
     fi
@@ -409,6 +485,8 @@ can_spidev_of() {
 }
 
 # can_iface_of_spidev <spidev>
+# Returns 0 (printed the iface name) / 1 (no net/ dir, or it's empty). Safe
+# to call bare.
 can_iface_of_spidev() {
     local spidev="$1"
     local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-/sys}"
@@ -424,12 +502,17 @@ can_iface_of_spidev() {
 
 # Interface Naming (§2b)
 # can_pin_name <spidev> <want>
-# Returns 0 if ok/renamed, 2 if name in use (EEXIST), 1 if error
+# Returns 0 if ok/renamed, 2 if name in use (EEXIST), 1 if error. On rc=1,
+# CAN_PIN_NAME_REASON is also set (see its declaration near the top of this
+# file) so a caller that needs to tell apart "no netdev yet" from "the ip
+# call itself failed" can do so without a new return value, keeping the §2b
+# contract (0/1/2) unchanged; it is cleared ("") whenever this returns 0 or 2.
 #
 # IMPORTANT: Do not call this function inside $( ), < <( ), or pipes.
 # This function calls can_run_bounded internally, which needs CAN_RUN_BOUNDED_PID
 # to survive in the parent shell. Capture output via file redirection; see
-# can_run_bounded for details.
+# can_run_bounded for details. Call it inside if/|| under the caller's
+# `set -e` -- see the file header.
 can_pin_name() {
     local spidev="$1"
     local want="$2"
@@ -437,20 +520,35 @@ can_pin_name() {
     local ip_cmd="${CAN_TOOLS_IP_CMD:-ip}"
     local net_dir="$sysfs_root/bus/spi/devices/$spidev/net"
 
-    [[ -d "$net_dir" ]] || return 1
+    CAN_PIN_NAME_REASON=""
 
-    local current
+    if [[ ! -d "$net_dir" ]]; then
+        CAN_PIN_NAME_REASON="no_net_dir"
+        return 1
+    fi
+
+    # N-M2 follow-up: must be initialized. Under the caller's `set -u`, an
+    # uninitialized `local` that the loop below never assigns (net_dir exists
+    # but is empty, e.g. mid-unbind/bind) is unbound, not merely empty, and
+    # referencing it below would abort with "current: unbound variable".
+    local current=""
     for iface in "$net_dir"/*; do
         [[ -d "$iface" ]] && current="${iface##*/}"
     done
 
-    [[ -z "$current" ]] && return 1
+    if [[ -z "$current" ]]; then
+        CAN_PIN_NAME_REASON="no_iface"
+        return 1
+    fi
     [[ "$current" == "$want" ]] && return 0
 
     if [[ -n "$want" ]]; then
-        # Check if want name is in use (N-C1: split rc branches)
-        can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link show "$want" >/dev/null 2>&1
-        local check_rc=$?
+        # Check if want name is in use (N-C1: split rc branches). Guard with
+        # `|| check_rc=$?`: a bare call here would abort under the caller's
+        # `set -e` whenever `ip link show` exits non-zero, which is the
+        # expected/common branch (the name is free).
+        local check_rc=0
+        can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link show "$want" >/dev/null 2>&1 || check_rc=$?
 
         if [[ $check_rc -eq 0 ]]; then
             # Name exists (already in use) - name collision
@@ -460,23 +558,29 @@ can_pin_name() {
             :
         elif [[ $check_rc -eq 124 ]]; then
             # Timeout/bounded abort
+            CAN_PIN_NAME_REASON="timeout"
             return 1
         else
             # Other error
+            CAN_PIN_NAME_REASON="ip_check_failed"
             return 1
         fi
 
-        # Down first (M1)
-        can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$current" down >/dev/null 2>&1
+        # Down first (M1). Best-effort: its outcome isn't checked (the
+        # rename attempt below is the real signal), so `|| true` rather than
+        # a bare statement that would abort this function under `set -e` if
+        # `ip link set down` itself fails.
+        can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$current" down >/dev/null 2>&1 || true
 
-        # Rename (M1: use bounded)
-        can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$current" name "$want" >/dev/null 2>&1
-        local rename_rc=$?
+        # Rename (M1: use bounded). Guard the same way as check_rc above.
+        local rename_rc=0
+        can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$current" name "$want" >/dev/null 2>&1 || rename_rc=$?
 
         # N-C1: Only return 0 if rename succeeded (rc==0)
         if [[ $rename_rc -eq 0 ]]; then
             return 0
         else
+            CAN_PIN_NAME_REASON="ip_rename_failed"
             return 1
         fi
     fi
@@ -491,7 +595,9 @@ can_pin_name() {
 # IMPORTANT: Do not call this function inside $( ), < <( ), or pipes.
 # This function calls can_run_bounded internally, which needs CAN_RUN_BOUNDED_PID
 # to survive in the parent shell. Capture output via file redirection; see
-# can_run_bounded for details.
+# can_run_bounded for details. Returns 0 on success, 1 on failure (including
+# CAN_TOOLS_DRY_RUN's early return, which is still 0). Call it inside if/||
+# under the caller's `set -e` -- see the file header.
 can_setup_iface() {
     local if="$1"
     local ip_cmd="${CAN_TOOLS_IP_CMD:-ip}"
@@ -518,8 +624,10 @@ can_setup_iface() {
         return 0
     fi
 
-    # Down (L-2: log it)
-    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$if" down >/dev/null 2>&1
+    # Down (L-2: log it). Best-effort, like can_pin_name's down: a bare
+    # statement here would abort under the caller's `set -e` if `ip` fails
+    # (e.g. already down), so ignore its result with `|| true`.
+    can_run_bounded "${WD_RTNL_TIMEOUT_S:-5}" "$ip_cmd" link set "$if" down >/dev/null 2>&1 || true
 
     # Build parameters (N-H2: always specify berr and fd)
     local berr_args="berr-reporting $berr"
@@ -549,6 +657,7 @@ can_setup_iface() {
 
 # Pause/Resume (§2b)
 # can_pause [min]
+# Returns 0 on success, 1 on an invalid duration. Safe to call bare.
 can_pause() {
     local min="${1:-${WD_PAUSE_DEFAULT_MIN:-30}}"
 
@@ -564,25 +673,34 @@ can_pause() {
     local now deadline
     now=$(can_now)
     deadline=$((now + min * 60))
-    echo "$deadline" >"$run_dir/watchdog.pause" 2>/dev/null
+    # Bare write before `return 0`: a failure here (e.g. disk full,
+    # permission) must not abort under the caller's `set -e`.
+    echo "$deadline" >"$run_dir/watchdog.pause" 2>/dev/null || true
     return 0
 }
 
 # can_unpause
+# Always returns 0; safe to call bare.
 can_unpause() {
     local run_dir="${CAN_TOOLS_RUN_DIR:-/run/can_tools}"
-    rm -f "$run_dir/watchdog.pause" 2>/dev/null
+    rm -f "$run_dir/watchdog.pause" 2>/dev/null || true
     return 0
 }
 
 # can_pause_active
+# Returns 0 if a pause is in effect, 1 otherwise (including "no pause file" /
+# "corrupt pause file"). Safe to call bare.
 can_pause_active() {
     local run_dir="${CAN_TOOLS_RUN_DIR:-/run/can_tools}"
     local pause_file="$run_dir/watchdog.pause"
 
     if [[ -f "$pause_file" ]]; then
-        local deadline now
-        deadline=$(cat "$pause_file" 2>/dev/null)
+        local deadline="" now
+        # Builtin `read` instead of `cat` (no fork); guard with `|| true`
+        # since a bare failing read here (file vanished mid-race) would
+        # otherwise abort this function under the caller's `set -e` before
+        # the validation below even runs.
+        read -r deadline 2>/dev/null <"$pause_file" || true
 
         # L3: Validate
         [[ ! "$deadline" =~ ^[0-9]+$ ]] && {
@@ -599,6 +717,9 @@ can_pause_active() {
 # Logging (§2b)
 # can_log <prio> <key=value...>
 # N-M1: Map priority names to numbers (case-insensitive), handle either
+# Always returns 0 (a failed write to CAN_TOOLS_LOG_FILE is swallowed rather
+# than propagated -- logging must never be the reason a caller's `set -e`
+# aborts). Safe to call bare.
 can_log() {
     local prio="$1"
     shift
@@ -624,19 +745,30 @@ can_log() {
     # Use $* not $@
     local msg="$*"
 
-    echo "<$prefix>can_tools[$$]: $msg" >&2
+    echo "<$prefix>can_tools[$$]: $msg" >&2 || true
 
     if [[ -n "$log_file" ]]; then
-        echo "[$(date -u +%Y-%m-%dT%H:%M:%S)] <$prefix> $msg" >>"$log_file"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%S)] <$prefix> $msg" >>"$log_file" || true
     fi
+
+    return 0
 }
 
 # Time (§2b)
 # can_now - Get current epoch seconds
 # Returns integer seconds (from EPOCHREALTIME if available, else date +%s).
+# Always returns 0; safe to call bare under the caller's `set -e`/`set -u`.
 can_now() {
-    if [[ -n "$CAN_TOOLS_FAKE_TIME_FILE" ]] && [[ -f "$CAN_TOOLS_FAKE_TIME_FILE" ]]; then
-        cat "$CAN_TOOLS_FAKE_TIME_FILE"
+    # ${CAN_TOOLS_FAKE_TIME_FILE:-}: under the caller's `set -u`, a bare
+    # $CAN_TOOLS_FAKE_TIME_FILE reference is an unbound-variable error when
+    # the caller never set it (the normal, non-test case) -- this is the
+    # errexit/nounset bug this whole PR exists to fix.
+    if [[ -n "${CAN_TOOLS_FAKE_TIME_FILE:-}" ]] && [[ -f "$CAN_TOOLS_FAKE_TIME_FILE" ]]; then
+        # `read` is a builtin; avoids forking `cat` on every call (can_pause /
+        # can_pause_active call this every watchdog tick).
+        local fake_now=""
+        read -r fake_now 2>/dev/null <"$CAN_TOOLS_FAKE_TIME_FILE" || true
+        echo "$fake_now"
     else
         # Use EPOCHREALTIME if available, otherwise date +%s
         if [[ -n "${EPOCHREALTIME+x}" ]]; then

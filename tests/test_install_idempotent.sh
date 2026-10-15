@@ -324,6 +324,37 @@ check $? "install.sh --help should print a usage message"
 if [[ ! -e "$s8h/opt/can_tools" || -z "$(ls -A "$s8h/opt/can_tools" 2>/dev/null)" ]]; then rc=0; else rc=1; fi
 check "$rc" "install.sh --help must not create any file under /opt"
 
+# ---------------------------------------------------------------------
+# Scenario 9 (PR#18 review C1): every installed unit's ExecStart binary
+# must actually exist under INSTALL_OPT_DIR/can_tools and be executable -
+# can_watchdog.service's ExecStart=/opt/can_tools/can_watchdog.sh was
+# previously left unsatisfied because can_watchdog.sh (and can_diag.sh)
+# were missing from files_to_install, so the unit would crash-loop on
+# every boot.
+# ---------------------------------------------------------------------
+echo "Scenario 9: every installed unit's ExecStart target exists and is executable (C1)"
+s9="$tmpdir/s9"
+mkdir -p "$s9/opt" "$s9/systemd" "$s9/tmpfiles" "$s9/run" "$s9/state" "$s9/fake"
+
+run_install "$s9/opt" "$s9/systemd" "$s9/tmpfiles" "$s9/run" "$s9/state" "$s9/fake" >"$tmpdir/s9_install.log" 2>&1
+rc=$?
+(( rc == 0 )); check $? "install for scenario 9 should succeed (rc=$rc): $(cat "$tmpdir/s9_install.log")"
+
+for unit_file in "$s9/systemd"/*.service; do
+    [[ -f "$unit_file" ]] || continue
+    exec_line=$(grep -m1 '^ExecStart=' "$unit_file" || true)
+    [[ -n "$exec_line" ]] || continue
+    exec_path="${exec_line#ExecStart=}"
+    exec_path="${exec_path%% *}"
+    exec_name="${exec_path##*/}"
+    installed_path="$s9/opt/can_tools/$exec_name"
+
+    if [[ -f "$installed_path" ]]; then rc=0; else rc=1; fi
+    check "$rc" "$(basename "$unit_file")'s ExecStart target ($exec_name) should be installed at $installed_path"
+    if [[ -x "$installed_path" ]]; then rc=0; else rc=1; fi
+    check "$rc" "$(basename "$unit_file")'s ExecStart target ($exec_name) should be executable"
+done
+
 echo ""
 echo "Results: $pass passed, $fail failed"
 exit "$fail"

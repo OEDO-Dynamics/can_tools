@@ -1,52 +1,78 @@
 # can\_tools
 
 ## Installation
-```
-mkdir <workspace>
-cd <workspace>
-git clone --recursive https://github.com/RyodoTanaka/can_tools.git
-cd <worksapce>/can_tools/can-utils
-mkdir build
-cd build
-cmake ..
-make -j`nproc` && sudo make install
-cd <worksapace>/can_tools
 
-# Copy files to /opt directory
-cd <workspace>
-sudo cp -rf can_tools /opt
-```
+### Prerequisites
 
-# Make systemctl service
-**CAUTION** The following code is only for **Raspberry Pi with CAN hat**.
+- Linux system (Raspberry Pi with CAN HAT, PCAN interface, or virtual CAN)
+- Optional: `can-utils` (for development/debugging)
+  ```bash
+  # Build and install can-utils (optional)
+  cd can-utils
+  mkdir build && cd build
+  cmake .. && make -j$(nproc) && sudo make install
+  ```
 
-## CAN HAT FD
+### Quick Install
+
+Install can_tools to `/opt/can_tools`:
 ```bash
-cd <workspace>/can_tools
-sudo systemctl enable ./canhat_fd_setup.service
-sudo systemctl start canhat_fd_setup.service
-# Then you can check whether the script works fine or not
+cd can_tools
+sudo bash install.sh
+```
+
+The installer is **idempotent** and **non-destructive**:
+- Files are only updated if changed
+- Existing configuration (`/opt/can_tools/can_tools.conf`) is never overwritten
+- Running services are not restarted
+
+### Configuration
+
+Configuration is read from `/opt/can_tools/can_tools.conf` (if it exists) or uses built-in defaults. Create a configuration file by copying the example:
+```bash
+sudo cp /opt/can_tools/can_tools.conf.example /opt/can_tools/can_tools.conf
+sudo nano /opt/can_tools/can_tools.conf
+```
+
+**Key settings:**
+- `CAN_IFACES` - Space-separated interface names (default: `can0 can1`)
+- `CAN_SPI_MAP` - SPI device to interface name mapping (default: `spi0.0:can0 spi1.0:can1`)
+- `CAN_BITRATE` - Bitrate in kbps (default: `250000`)
+- `CAN_FD` - Enable CAN FD (default: `on`)
+- `CAN_TXQUEUELEN` - TX queue length (default: `10`)
+
+For full option details, see `/opt/can_tools/can_tools.conf.example`.
+
+### Systemd Services
+
+After installation, enable the appropriate setup service for your hardware:
+
+**CAN HAT FD** (supports CAN FD at 2 Mbps data rate):
+```bash
+sudo systemctl enable canhat_fd_rename.service canhat_fd_setup.service
+sudo systemctl start canhat_fd_rename.service canhat_fd_setup.service
 sudo systemctl status canhat_fd_setup.service
 ```
 
-## CAN HAT PLUS
+**CAN HAT Plus** (standard CAN only):
 ```bash
-cd <workspace>/can_tools
-sudo systemctl enable ./canhat_plus_setup.service
-sudo systemctl start canhat_plus_setup.service
-# Then you can check whether the script works fine or not
+sudo systemctl enable canhat_plus_rename.service canhat_plus_setup.service
+sudo systemctl start canhat_plus_rename.service canhat_plus_setup.service
 sudo systemctl status canhat_plus_setup.service
 ```
 
-## CAN Monitor Service & Timer
-The monitor script (`can_monitor.sh`) checks CAN interfaces and is installed under `/opt/can_tools`. The timer unit triggers the oneshot service automatically—manual service runs are not required.
+**CAN Monitor Service** (optional, watches interface health):
 ```bash
-cd /opt/can_tools
-# Enable the 10-second timer (runs the service on schedule)
-sudo systemctl enable ./can_monitor.timer
-sudo systemctl start can_monitor.timer
-# Verify service runs via the timer
-sudo journalctl -u can_monitor.service -f
+sudo systemctl enable can_monitor.service
+sudo systemctl start can_monitor.service
+sudo journalctl -u can_monitor.service -f  # View logs
+```
+
+### Check for Installation Changes
+
+To see what would be changed without making any changes:
+```bash
+sudo CHECK_MODE=1 bash install.sh
 ```
 
 ## CAN Interface Setup

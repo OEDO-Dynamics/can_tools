@@ -1,53 +1,129 @@
 # can\_tools
 
 ## Installation
-```
-mkdir <workspace>
-cd <workspace>
-git clone --recursive https://github.com/RyodoTanaka/can_tools.git
-cd <worksapce>/can_tools/can-utils
-mkdir build
-cd build
-cmake ..
-make -j`nproc` && sudo make install
-cd <worksapace>/can_tools
 
-# Copy files to /opt directory
-cd <workspace>
-sudo cp -rf can_tools /opt
-```
+### Prerequisites
 
-# Make systemctl service
-**CAUTION** The following code is only for **Raspberry Pi with CAN hat**.
+- Linux system (Raspberry Pi with CAN HAT, PCAN interface, or virtual CAN)
+- Optional: `can-utils` (for development/debugging)
+  ```bash
+  # Build and install can-utils (optional)
+  cd can-utils
+  mkdir build && cd build
+  cmake .. && make -j$(nproc) && sudo make install
+  ```
 
-## CAN HAT FD
+### Quick Install
+
 ```bash
-cd <workspace>/can_tools
-sudo systemctl enable ./canhat_fd_setup.service
-sudo systemctl start canhat_fd_setup.service
-# Then you can check whether the script works fine or not
-sudo systemctl status canhat_fd_setup.service
+git clone --recursive https://github.com/OEDO-Dynamics/can_tools.git
+cd can_tools
+sudo ./install.sh
 ```
 
-## CAN HAT PLUS
+This installs can_tools to `/opt/can_tools`, copies the `canhat_fd_rename`/
+`canhat_fd_setup` systemd units into `/etc/systemd/system` and enables them,
+and creates `/run/can_tools` and `/var/lib/can_tools` (plus a `tmpfiles.d`
+drop-in so they survive a reboot). `canhat_plus_*` (CAN HAT **Plus**
+hardware) is never installed or enabled by `install.sh`, under any flag -
+see "CAN HAT Plus" below for the manual setup. It is **idempotent** and
+**non-destructive**:
+- Files are only written if their contents changed.
+- Existing configuration (`/opt/can_tools/can_tools.conf`) is never
+  overwritten; `install.sh` creates it (empty) only on first install, and
+  `can_tools.conf.example` is always refreshed alongside it so the two never
+  drift apart.
+- Running services are never stopped or restarted by `install.sh` - **not
+  even `canhat_fd_setup.service`**. Bringing CAN interfaces down/up while the
+  machine is live was the trigger for a prior field incident (see the
+  "Applying configuration changes" note below).
+- A legacy unit that was deployed as a symlink straight into
+  `/opt/can_tools/*.service` is replaced with a real copy (same no-restart
+  guarantee).
+- The retired `can_monitor.timer`/`can_monitor.service` are stopped,
+  disabled and removed if still present from an older install;
+  `/var/log/can_monitor.log` itself is left alone.
+
+To see what would change without touching anything:
 ```bash
-cd <workspace>/can_tools
-sudo systemctl enable ./canhat_plus_setup.service
-sudo systemctl start canhat_plus_setup.service
-# Then you can check whether the script works fine or not
-sudo systemctl status canhat_plus_setup.service
+sudo ./install.sh --check
+```
+It prints a `diff -u` for every file that would change and exits non-zero if
+there is anything to install; running it twice in a row should show no
+differences and exit 0.
+
+### Configuration
+
+`/opt/can_tools/can_tools.conf` is read if it exists, otherwise built-in
+defaults apply. `install.sh` already creates an empty copy (all lines
+commented out) on first install - write only the keys you want to override:
+```bash
+sudo nano /opt/can_tools/can_tools.conf
 ```
 
-## CAN Monitor Service & Timer
-The monitor script (`can_monitor.sh`) checks CAN interfaces and is installed under `/opt/can_tools`. The timer unit triggers the oneshot service automatically—manual service runs are not required.
+**Key settings:**
+- `CAN_IFACES` - Space-separated interface names (default: `can0 can1`)
+- `CAN_SPI_MAP` - SPI device to interface name mapping (default: `spi0.0:can0 spi1.0:can1`)
+- `CAN_BITRATE` - Bitrate in bps (default: `250000`)
+- `CAN_FD` - Enable CAN FD (default: `on`)
+- `CAN_TXQUEUELEN` - TX queue length (default: `10`)
+
+For full option details, see `/opt/can_tools/can_tools.conf.example`.
+
+#### Applying configuration changes
+
+A conf edit (or a reinstall that updates a script) only takes effect:
+- at the **next reboot**, or
+- by running `sudo systemctl restart canhat_fd_setup.service` while the
+  **machine is stopped** (hydraulics locked, implement down, key state
+  decided).
+
+Never restart it, or run `ip link set ... down/up`, while the machine is
+live - bringing CAN down/up while the controller is sending/receiving is
+what caused the 2026-10-14 incident. Until the next reboot (or that manual,
+machine-stopped restart), the running `canhat_fd_setup.service` keeps using
+the previously-applied settings.
+
+### Systemd Services
+
+**CAN HAT FD** (supports CAN FD at 2 Mbps data rate): `install.sh` already
+installs and enables these units; they are started by systemd itself at boot
+(`WantedBy=multi-user.target`). Use `systemctl status`/`journalctl -u` to
+check them - don't `systemctl start`/`restart` them manually on a live
+machine (see above).
 ```bash
-cd /opt/can_tools
-# Enable the 10-second timer (runs the service on schedule)
-sudo systemctl enable ./can_monitor.timer
-sudo systemctl start can_monitor.timer
-# Verify service runs via the timer
-sudo journalctl -u can_monitor.service -f
+sudo systemctl status canhat_fd_rename.service canhat_fd_setup.service
 ```
+
+**CAN HAT Plus** (standard CAN only, different hardware from CAN HAT FD) is
+out of scope for `install.sh` - it is never installed or enabled, under any
+flag. `canhat_plus_*` has no ordering or locking relationship with
+`canhat_fd_setup.service`, so enabling both on the same machine lets them
+race each other (and overwrite each other's `txqueuelen`/`restart-ms`, or
+leave an interface down if the FD parameters land on CAN HAT Plus/MCP2515
+hardware, which doesn't support CAN FD). On an actual CAN HAT Plus machine,
+set it up by hand instead:
+```bash
+# Make sure the FD units are not also enabled on this machine:
+sudo systemctl disable canhat_fd_rename.service canhat_fd_setup.service
+
+# Install the plus units yourself (install.sh never does this):
+sudo cp canhat_plus_rename.service canhat_plus_setup.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now canhat_plus_rename.service canhat_plus_setup.service
+```
+`canhat_plus_setup.bash`/`canhat_plus_rename.bash`/`enable_canhat_plus.sh`
+are copied to `/opt/can_tools` by `install.sh` regardless (harmless - they
+are never run unless a unit or you invoke them). Note that `can_watchdog`
+(once it exists) is FD-only for now - it is not meant to run on a CAN HAT
+Plus machine.
+
+**Do not run `install.sh` on a CAN HAT Plus machine once it is set up this
+way.** `install.sh` unconditionally (re-)enables `canhat_fd_rename.service`/
+`canhat_fd_setup.service` on every run, which would undo the `systemctl
+disable` above and put the machine back into the FD/Plus race this section
+exists to avoid. Update a CAN HAT Plus machine by hand too - copy over the
+changed files/units yourself instead of running `install.sh`.
 
 ## CAN Interface Setup
 

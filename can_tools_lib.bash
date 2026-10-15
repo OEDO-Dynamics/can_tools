@@ -238,6 +238,13 @@ can_unlock() {
 # can_run_bounded <timeout_s> <cmd...>
 # Child runs with fd 9 closed. Output to temp file. PID preserved in parent.
 # N-H1: Disconnect child's stdio from parent to avoid blocking $( ) calls
+#
+# IMPORTANT: Do not call this function inside $( ), < <( ), or pipes (e.g.
+# can_iface_states | while ...). These create subshells that lose
+# CAN_RUN_BOUNDED_PID, defeating the guard that prevents multiple hung children
+# (R2). Capture output via file redirection: can_run_bounded ... >"$file"; then
+# read from "$file". Same applies to functions that call can_run_bounded:
+# can_iface_states, can_pin_name, can_setup_iface.
 can_run_bounded() {
     local timeout="$1"
     shift
@@ -248,9 +255,9 @@ can_run_bounded() {
         return 124
     fi
 
-    # Create temp file for output
+    # Create temp file for output using BASHPID for uniqueness across subshells (低-4)
     local outfile
-    outfile="${CAN_TOOLS_RUN_DIR:-/run/can_tools}/bounded_$$.tmp"
+    outfile="${CAN_TOOLS_RUN_DIR:-/run/can_tools}/bounded_$$.${BASHPID}.tmp"
     mkdir -p "${CAN_TOOLS_RUN_DIR:-/run/can_tools}" 2>/dev/null || true
 
     # Run in background with fd 9 closed, output to file, stdio disconnected (N-H1)
@@ -418,6 +425,11 @@ can_iface_of_spidev() {
 # Interface Naming (§2b)
 # can_pin_name <spidev> <want>
 # Returns 0 if ok/renamed, 2 if name in use (EEXIST), 1 if error
+#
+# IMPORTANT: Do not call this function inside $( ), < <( ), or pipes.
+# This function calls can_run_bounded internally, which needs CAN_RUN_BOUNDED_PID
+# to survive in the parent shell. Capture output via file redirection; see
+# can_run_bounded for details.
 can_pin_name() {
     local spidev="$1"
     local want="$2"
@@ -475,6 +487,11 @@ can_pin_name() {
 # Interface Setup (§2b)
 # can_setup_iface <if>
 # N-H2: Always explicitly include fd on/off and berr-reporting on/off
+#
+# IMPORTANT: Do not call this function inside $( ), < <( ), or pipes.
+# This function calls can_run_bounded internally, which needs CAN_RUN_BOUNDED_PID
+# to survive in the parent shell. Capture output via file redirection; see
+# can_run_bounded for details.
 can_setup_iface() {
     local if="$1"
     local ip_cmd="${CAN_TOOLS_IP_CMD:-ip}"
@@ -616,7 +633,7 @@ can_log() {
 
 # Time (§2b)
 # can_now - Get current epoch seconds
-# C1: Return integer milliseconds or use EPOCHREALTIME
+# Returns integer seconds (from EPOCHREALTIME if available, else date +%s).
 can_now() {
     if [[ -n "$CAN_TOOLS_FAKE_TIME_FILE" ]] && [[ -f "$CAN_TOOLS_FAKE_TIME_FILE" ]]; then
         cat "$CAN_TOOLS_FAKE_TIME_FILE"

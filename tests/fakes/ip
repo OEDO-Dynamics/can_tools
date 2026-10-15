@@ -119,6 +119,33 @@ case "$1" in
                         if [[ -n "$newname" && "$if_name" != "$newname" ]]; then
                             [[ -d "$fake_dir/$newname" ]] && exit 1
                             mv "$fake_dir/$if_name" "$fake_dir/$newname" 2>/dev/null || exit 1
+
+                            # Update sysfs symlinks (低-3): rename in /sys/class/net
+                            # and update spidev's net directory
+                            sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-}"
+                            if [[ -n "$sysfs_root" && -d "$sysfs_root/class/net/$if_name" ]]; then
+                                # Find spidev via old device link
+                                if [[ -L "$sysfs_root/class/net/$if_name/device" ]]; then
+                                    old_target=$(readlink -f "$sysfs_root/class/net/$if_name/device")
+                                    spidev="${old_target##*/}"
+                                    if [[ -n "$spidev" ]]; then
+                                        # Remove old symlink from spidev's net
+                                        rm -f "$sysfs_root/bus/spi/devices/$spidev/net/$if_name" 2>/dev/null || true
+                                        # Create new symlink from spidev's net with new name
+                                        ln -sf "$sysfs_root/class/net/$newname" "$sysfs_root/bus/spi/devices/$spidev/net/$newname" 2>/dev/null || true
+                                    fi
+                                fi
+                                # Rename in /sys/class/net
+                                mv "$sysfs_root/class/net/$if_name" "$sysfs_root/class/net/$newname" 2>/dev/null || true
+                                # Update device symlink in new location
+                                if [[ -L "$sysfs_root/class/net/$newname/device" ]]; then
+                                    old_target=$(readlink -f "$sysfs_root/class/net/$newname/device")
+                                    spidev="${old_target##*/}"
+                                    if [[ -n "$spidev" ]]; then
+                                        ln -sf "$sysfs_root/bus/spi/devices/$spidev" "$sysfs_root/class/net/$newname/device" 2>/dev/null || true
+                                    fi
+                                fi
+                            fi
                         fi
                         exit 0
                         ;;

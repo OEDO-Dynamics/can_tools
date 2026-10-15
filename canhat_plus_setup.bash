@@ -5,6 +5,7 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2155
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LIB_PATH="$SCRIPT_DIR/can_tools_lib.bash"
 readonly CONF_PATH="${CAN_TOOLS_CONF:-$SCRIPT_DIR/can_tools.conf}"
@@ -14,6 +15,7 @@ readonly CONF_PATH="${CAN_TOOLS_CONF:-$SCRIPT_DIR/can_tools.conf}"
     echo "ERROR: can_tools_lib.bash not found at $LIB_PATH" >&2
     exit 1
 }
+# shellcheck source=can_tools_lib.bash
 source "$LIB_PATH" || exit 1
 
 # For CAN HAT Plus: disable CAN FD

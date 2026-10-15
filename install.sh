@@ -8,6 +8,7 @@
 
 set -euo pipefail
 
+# shellcheck disable=SC2155
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration from environment (for testing)

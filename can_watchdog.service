@@ -1,5 +1,11 @@
 [Unit]
-Description=Resident CAN interface watchdog (bus-off / rx-offload stall recovery)
+# FD-only: this unit is deployed by install.sh, which only targets CAN HAT
+# FD (MCP2518FD) machines. CAN HAT+ (MCP2515) hardware is set up manually
+# and install.sh is not used there (see install.sh's own header and
+# README), so this unit is simply never installed on a HAT+ machine. The
+# Wants=/After= below is specifically on the FD setup unit, not a generic
+# "whichever CAN setup ran" dependency - do not point it at canhat_plus_*.
+Description=Resident CAN interface watchdog (bus-off / rx-offload stall recovery, CAN HAT FD only)
 Wants=canhat_fd_setup.service
 After=canhat_fd_setup.service
 StartLimitIntervalSec=0

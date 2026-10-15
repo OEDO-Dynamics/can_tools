@@ -36,9 +36,9 @@
 declare -g CAN_IFACES="can0 can1"
 declare -g CAN_SPI_MAP="spi0.0:can0 spi1.0:can1"
 declare -g CAN_BITRATE=250000
-declare -g CAN_RESTART_MS=100
+declare -g CAN_RESTART_MS=0
 declare -g CAN_BERR_REPORTING="off"
-declare -g CAN_FD="on"
+declare -g CAN_FD="off"
 declare -g CAN_DBITRATE=2000000
 declare -g CAN_TXQUEUELEN=10
 declare -g CAN_DEPENDENT_UNITS=""
@@ -110,9 +110,9 @@ _can_set_defaults() {
     CAN_IFACES="can0 can1"
     CAN_SPI_MAP="spi0.0:can0 spi1.0:can1"
     CAN_BITRATE=250000
-    CAN_RESTART_MS=100
+    CAN_RESTART_MS=0
     CAN_BERR_REPORTING="off"
-    CAN_FD="on"
+    CAN_FD="off"
     CAN_DBITRATE=2000000
     CAN_TXQUEUELEN=10
     CAN_DEPENDENT_UNITS=""

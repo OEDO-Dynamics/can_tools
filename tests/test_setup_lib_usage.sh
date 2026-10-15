@@ -221,16 +221,20 @@ rc=$?
 (( rc != 0 )); check $? "canhat_fd_setup.bash with no argument should fail, got $rc"
 
 # ---------------------------------------------------------------------
-# H3: the ip arguments must include restart-ms 100, fd on (+ dbitrate), and
-# txqueuelen 10 (current repo defaults, preserved from the incident).
+# H3: the ip arguments must include restart-ms 0, fd off, and txqueuelen 10
+# (lib defaults as of Issue #9's final switch commit: the resident
+# can_watchdog.service now owns bus-off recovery instead of the kernel's
+# own restart-ms, and the edge apps never write CAN FD frames - see the
+# Issue's 論点 C). Pre-switch this asserted restart-ms 100 / fd on
+# (dbitrate 2000000); fd=off means no dbitrate/fd-on arguments appear at all.
 # ---------------------------------------------------------------------
 echo "Testing canhat_fd_setup.bash: ip arguments (restart-ms/fd/txqueuelen)"
-grep "link set can0 up" "$fake4/calls.log" | grep -q "restart-ms 100"
-check $? "setup should request restart-ms 100"
-grep "link set can0 up" "$fake4/calls.log" | grep -q "fd on"
-check $? "setup should request fd on"
-grep "link set can0 up" "$fake4/calls.log" | grep -q "dbitrate 2000000"
-check $? "setup should request dbitrate 2000000 when fd is on"
+grep "link set can0 up" "$fake4/calls.log" | grep -q "restart-ms 0"
+check $? "setup should request restart-ms 0"
+grep "link set can0 up" "$fake4/calls.log" | grep -q "fd off"
+check $? "setup should request fd off"
+! grep "link set can0 up" "$fake4/calls.log" | grep -q "dbitrate"
+check $? "setup should not request dbitrate when fd is off"
 grep -q "link set can0 txqueuelen 10" "$fake4/calls.log"
 check $? "setup should set txqueuelen 10"
 

@@ -289,6 +289,41 @@ rc=$?
 grep -qi "would enable" "$run_check_log"
 check $? "--check should explicitly mention the unit needs enabling (L-new1): $(cat "$run_check_log")"
 
+# ---------------------------------------------------------------------
+# Scenario 8 (M-r4a): an unrecognized argument must never fall through
+# into a normal install (or into --check's "just show a diff" path
+# either) - a stale "--plus" (removed in M-r3, but it was in an earlier
+# README/PR comment and could still be muscle memory) or a typo like
+# "--chek" must be rejected outright, before anything is touched.
+# ---------------------------------------------------------------------
+echo "Scenario 8: unknown arguments are rejected before anything runs (M-r4a)"
+for bad_arg in "--plus" "--chek"; do
+    s8="$tmpdir/s8_${bad_arg//-/}"
+    mkdir -p "$s8/opt" "$s8/systemd" "$s8/tmpfiles" "$s8/run" "$s8/state" "$s8/fake"
+
+    run_install "$s8/opt" "$s8/systemd" "$s8/tmpfiles" "$s8/run" "$s8/state" "$s8/fake" "$bad_arg" >"$tmpdir/s8_${bad_arg//-/}.log" 2>&1
+    rc=$?
+    (( rc != 0 )); check $? "install.sh $bad_arg must exit non-zero (M-r4a), got rc=$rc"
+
+    if [[ ! -e "$s8/opt/can_tools" || -z "$(ls -A "$s8/opt/can_tools" 2>/dev/null)" ]]; then rc=0; else rc=1; fi
+    check "$rc" "install.sh $bad_arg must not create any file under /opt (M-r4a)"
+    if [[ ! -e "$s8/systemd" || -z "$(ls -A "$s8/systemd" 2>/dev/null)" ]]; then rc=0; else rc=1; fi
+    check "$rc" "install.sh $bad_arg must not create any systemd unit (M-r4a)"
+    if [[ ! -s "$s8/fake/calls.log" ]]; then rc=0; else rc=1; fi
+    check "$rc" "install.sh $bad_arg must never call systemctl at all (M-r4a): $(cat "$s8/fake/calls.log" 2>/dev/null)"
+done
+
+# -h/--help prints usage and exits 0, without touching anything either.
+s8h="$tmpdir/s8_help"
+mkdir -p "$s8h/opt" "$s8h/systemd" "$s8h/tmpfiles" "$s8h/run" "$s8h/state" "$s8h/fake"
+run_install "$s8h/opt" "$s8h/systemd" "$s8h/tmpfiles" "$s8h/run" "$s8h/state" "$s8h/fake" --help >"$tmpdir/s8_help.log" 2>&1
+rc=$?
+(( rc == 0 )); check $? "install.sh --help should exit 0, got rc=$rc"
+grep -qi "usage" "$tmpdir/s8_help.log"
+check $? "install.sh --help should print a usage message"
+if [[ ! -e "$s8h/opt/can_tools" || -z "$(ls -A "$s8h/opt/can_tools" 2>/dev/null)" ]]; then rc=0; else rc=1; fi
+check "$rc" "install.sh --help must not create any file under /opt"
+
 echo ""
 echo "Results: $pass passed, $fail failed"
 exit "$fail"

@@ -33,12 +33,36 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
-# --check is accepted as an argument (§4); CHECK_MODE=1 in the environment
-# still works too, for scripted callers.
+_usage() {
+    cat <<'EOF'
+Usage: install.sh [--check]
+
+  --check      show what would change (diff -u + unit enable-state), make
+               no changes, and exit non-zero if there is anything to do.
+  -h, --help   show this message and exit.
+
+No other arguments are accepted - there is no --plus (see the README's
+"CAN HAT Plus" section for the manual, HAT+-only setup instead).
+EOF
+}
+
+# M-r4a: an unrecognized argument (e.g. a typo like "--chek", or a stale
+# "--plus" from an older README/habit - HAT+ is out of scope here, see
+# above) must never fall through into a normal install. Parse and validate
+# every argument before doing anything else, so a typo can never be
+# mistaken for the plain install it is NOT supposed to run as, and never
+# for --check either (which would make the "it only showed a diff" safety
+# net itself unsafe).
 CHECK_MODE="${CHECK_MODE:-0}"
 for arg in "$@"; do
     case "$arg" in
         --check) CHECK_MODE=1 ;;
+        -h|--help) _usage; exit 0 ;;
+        *)
+            echo "install.sh: unknown argument: $arg" >&2
+            _usage >&2
+            exit 2
+            ;;
     esac
 done
 readonly CHECK_MODE

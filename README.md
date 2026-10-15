@@ -118,6 +118,13 @@ are never run unless a unit or you invoke them). Note that `can_watchdog`
 (once it exists) is FD-only for now - it is not meant to run on a CAN HAT
 Plus machine.
 
+**Do not run `install.sh` on a CAN HAT Plus machine once it is set up this
+way.** `install.sh` unconditionally (re-)enables `canhat_fd_rename.service`/
+`canhat_fd_setup.service` on every run, which would undo the `systemctl
+disable` above and put the machine back into the FD/Plus race this section
+exists to avoid. Update a CAN HAT Plus machine by hand too - copy over the
+changed files/units yourself instead of running `install.sh`.
+
 ## CAN Interface Setup
 
 ### PCAN setup

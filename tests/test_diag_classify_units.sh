@@ -26,6 +26,11 @@ check() {
 repo_dir=$(cd "$(dirname "$0")/.." && pwd) || exit 1
 # shellcheck source=/dev/null
 source "$repo_dir/can_diag.sh"
+# can_diag.sh only sources can_tools_lib.bash inside its own execution guard
+# (main(), never reached when merely sourced like this); the L-3 regression
+# guard below needs the lib's real CAN_RESTART_MS default, so source it here.
+# shellcheck source=/dev/null
+source "$repo_dir/can_tools_lib.bash"
 
 mk_line() {
     # mk_line <iface> <can_id_hex> <data_hex (<=16 hex chars, zero-padded)>
@@ -142,6 +147,34 @@ _cnt_rec_max=()
 diag_classify_line "$(mk_line can0 21000000 "0000000000000000")" # bit 24 (0x1000000) set, 0x200 NOT set
 if [[ -z "${error_counts[can0|class|CNT]:-}" ]]; then check 0 "bit 0x1000000 alone (the old wrong CNT mask) must NOT be classified as CNT"
 else check 1 "bit 0x1000000 alone (the old wrong CNT mask) must NOT be classified as CNT"
+fi
+
+# --- L-3: _diag_resolve_restart_ms() picks the original restart-ms when
+# known, and falls back to the lib's CAN_RESTART_MS (reflecting conf) -
+# never a hardcoded guess - when it could not be read, flagging the
+# fallback via _DIAG_RESTART_MS_FELL_BACK.
+_diag_resolve_restart_ms "0" "50"
+if [[ "$_DIAG_RESTART_MS_RESULT" == "0" && "$_DIAG_RESTART_MS_FELL_BACK" == "0" ]]; then
+    check 0 "a known original restart-ms (0) should be used as-is, not replaced by CAN_RESTART_MS"
+else
+    check 1 "a known original restart-ms (0) should be used as-is, not replaced by CAN_RESTART_MS (got result=$_DIAG_RESTART_MS_RESULT fell_back=$_DIAG_RESTART_MS_FELL_BACK)"
+fi
+
+_diag_resolve_restart_ms "" "50"
+if [[ "$_DIAG_RESTART_MS_RESULT" == "50" && "$_DIAG_RESTART_MS_FELL_BACK" == "1" ]]; then
+    check 0 "an unreadable original restart-ms should fall back to the lib's CAN_RESTART_MS (L-3), not a hardcoded 100"
+else
+    check 1 "an unreadable original restart-ms should fall back to the lib's CAN_RESTART_MS (L-3), not a hardcoded 100 (got result=$_DIAG_RESTART_MS_RESULT fell_back=$_DIAG_RESTART_MS_FELL_BACK)"
+fi
+
+# Regression guard for the exact bug: with the lib's actual default
+# (CAN_RESTART_MS=0, declared in can_tools_lib.bash), an unreadable
+# original must resolve to 0, never the old hardcoded 100.
+_diag_resolve_restart_ms "" "$CAN_RESTART_MS"
+if [[ "$_DIAG_RESTART_MS_RESULT" == "0" ]]; then
+    check 0 "with the lib's default CAN_RESTART_MS=0, an unreadable original must resolve to 0, not 100"
+else
+    check 1 "with the lib's default CAN_RESTART_MS=0, an unreadable original must resolve to 0, not 100 (got: $_DIAG_RESTART_MS_RESULT)"
 fi
 
 echo ""

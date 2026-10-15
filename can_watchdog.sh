@@ -110,6 +110,10 @@ _wd_state_dump() {
 # rebind quota back just because the process restarted.
 _wd_rebind_times_path() { printf '%s/rebind_times_%s' "$_WD_STATE_DIR" "$1"; }
 _wd_busoff_times_path() { printf '%s/busoff_times_%s' "$_WD_STATE_DIR" "$1"; }
+# L-5: a separate, never-pruned counter for the snapshot's busoff_total= -
+# see the comment on _wd_snapshot for why busoff_times_* alone cannot serve
+# as a cumulative count.
+_wd_busoff_total_path() { printf '%s/busoff_total_%s' "$_WD_STATE_DIR" "$1"; }
 
 _wd_append_time() {
     local f="$1" now="$2"
@@ -207,16 +211,31 @@ _wd_log_force() {
     _wd_file_set "$_WD_RUN_DIR/log/${key}.cnt" 0
 }
 
-# Formats "rx=.. tx=.. rxfifo=.. txfifo=.. ifindex=.. busoff=.." for CRIT /
-# NOTICE lines (§1d-1, §1e: "カウンタの snapshot"), reading current sysfs
-# counters fresh (these calls are all on rare/important-event paths, not the
-# per-second hot loop, so one extra can_read_stats fork each is fine).
+# Formats "rx=.. tx=.. rxfifo=.. txfifo=.. ifindex=.. busoff=.. busoff_total=.."
+# for CRIT / NOTICE lines (§1d-1, §1e: "カウンタの snapshot"), reading
+# current sysfs counters fresh (these calls are all on rare/important-event
+# paths, not the per-second hot loop, so one extra can_read_stats fork each
+# is fine).
+#
+# L-5: busoff= is NOT a lifetime count. busoff_times_<if> is shared with
+# _wd_busoff_recover's storm detection (§1b), which calls _wd_count_times on
+# it with WD_STORM_WINDOW_S (default 60s) every recovery - and
+# _wd_count_times prunes entries outside its window as a side effect every
+# time it runs. So by the time _wd_snapshot reads the same file (with an
+# effectively-unbounded window), only whatever survived the storm window's
+# most recent prune is left: in practice, busoff= is "bus-offs in roughly
+# the last WD_STORM_WINDOW_S seconds", not "since the watchdog started".
+# busoff_total= is a separate, append-only counter (never pruned) bumped
+# once per recovery in _wd_busoff_recover, giving the true cumulative count
+# for as long as this state file has existed (state dir survives reboots
+# and Restart=always respawns - see the comment above _wd_rebind_times_path).
 _wd_snapshot() {
-    local ifn="$1" now="$2" rx tx rxfifo txfifo ifindex busoff_n
+    local ifn="$1" now="$2" rx tx rxfifo txfifo ifindex busoff_n busoff_total
     read -r rx tx rxfifo txfifo ifindex <<<"$(can_read_stats "$ifn" 2>/dev/null)"
     busoff_n=$(_wd_count_times "$(_wd_busoff_times_path "$ifn")" 315360000 "$now")
-    printf 'rx=%s tx=%s rxfifo=%s txfifo=%s ifindex=%s busoff=%s' \
-        "${rx:-0}" "${tx:-0}" "${rxfifo:-0}" "${txfifo:-0}" "${ifindex:-0}" "${busoff_n:-0}"
+    busoff_total=$(_wd_file_get "$(_wd_busoff_total_path "$ifn")" 0)
+    printf 'rx=%s tx=%s rxfifo=%s txfifo=%s ifindex=%s busoff=%s busoff_total=%s' \
+        "${rx:-0}" "${tx:-0}" "${rxfifo:-0}" "${txfifo:-0}" "${ifindex:-0}" "${busoff_n:-0}" "${busoff_total:-0}"
 }
 
 _wd_log_summary() {
@@ -420,6 +439,12 @@ _wd_busoff_recover() {
     can_setup_iface "$ifn"
     local rc=$?
     _wd_append_time "$(_wd_busoff_times_path "$ifn")" "$now"
+    # L-5: bump the never-pruned cumulative counter alongside the
+    # storm-window one above - see the comment on _wd_snapshot.
+    local _busoff_total_file _busoff_total_val
+    _busoff_total_file="$(_wd_busoff_total_path "$ifn")"
+    _busoff_total_val=$(_wd_file_get "$_busoff_total_file" 0)
+    _wd_file_set "$_busoff_total_file" "$((_busoff_total_val + 1))"
     _WD_IFSTATE[BUSOFF_LAST_RECOVERY_TS]=$now
 
     if (( rc != 0 )); then
@@ -485,7 +510,7 @@ _wd_flush_check() {
     sleep 0.1
     read -r r2 t2 rf2 tf2 _ <<<"$(can_read_stats "$ifn")"
     if [[ "$r1" != "$r2" || "$t1" != "$t2" || "$rf1" != "$rf2" || "$tf1" != "$tf2" ]]; then
-        can_unlock
+        can_unlock || true
         _wd_log warning "$ifn" flush_aborted_recheck "$now" "changed_between_reads=1"
         _WD_IFSTATE[FLUSH_STALE_CONSEC]=0
         return 0
@@ -496,7 +521,7 @@ _wd_flush_check() {
     fi
     can_setup_iface "$ifn"
     local rc=$?
-    can_unlock
+    can_unlock || true
 
     local last_ts=${_WD_IFSTATE[FLUSH_LAST_TS]:-0} backoff_s=${_WD_IFSTATE[FLUSH_BACKOFF_S]:-0}
     local next_backoff max="${WD_FLUSH_BACKOFF_MAX_S:-30}"
@@ -556,7 +581,7 @@ _wd_rebind_recover() {
 
     local oops_line
     if ! oops_line=$(_wd_precheck_oops); then
-        can_unlock
+        can_unlock || true
         _wd_log_force crit "$ifn" oops_detected "$now" "line=${oops_line}"
         _wd_mark_degraded "$ifn" "oops_detected" "$now"
         return 1
@@ -564,14 +589,14 @@ _wd_rebind_recover() {
 
     local spidev
     if ! spidev=$(can_spidev_of "$ifn"); then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "spidev_not_found" "$now"
         return 1
     fi
 
     if [[ -n "${CAN_TOOLS_DRY_RUN:-}" ]]; then
         can_log info "DRY_RUN: rebind recovery for $ifn (spidev=$spidev)"
-        can_unlock
+        can_unlock || true
         return 0
     fi
 
@@ -583,7 +608,7 @@ _wd_rebind_recover() {
     can_run_bounded "${WD_REBIND_TIMEOUT_S:-10}" "${CAN_TOOLS_IP_CMD:-ip}" link set "$ifn" down >/dev/null 2>&1
     down_rc=$?
     if (( down_rc == 124 )); then
-        can_unlock
+        can_unlock || true
         _wd_log_force crit "$ifn" down_timeout "$now" "spidev=$spidev"
         _wd_mark_degraded "$ifn" "down_timeout" "$now"
         return 1
@@ -599,7 +624,7 @@ _wd_rebind_recover() {
         # Marker intentionally left behind: the child may still be writing
         # or stuck inside the kernel unbind path. can_unlock here (§1d: "1d
         # の手順にcan_unlockする(unbind_inflightマーカーは残す)を明記").
-        can_unlock
+        can_unlock || true
         _wd_log_force crit "$ifn" unbind_timeout "$now" "spidev=$spidev"
         _wd_mark_degraded "$ifn" "unbind_timeout" "$now"
         return 1
@@ -607,7 +632,7 @@ _wd_rebind_recover() {
     rm -f "$marker" 2>/dev/null || true
 
     if (( unbind_rc != 0 )); then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "unbind_failed" "$now"
         return 1
     fi
@@ -617,7 +642,7 @@ _wd_rebind_recover() {
     can_run_bounded "${WD_REBIND_TIMEOUT_S:-10}" bash -c 'echo "$0" >"$1"' "$spidev" "$bind_file"
     local bind_rc=$?
     if (( bind_rc != 0 )); then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "bind_failed" "$now"
         return 1
     fi
@@ -629,7 +654,7 @@ _wd_rebind_recover() {
         waited=$((waited + 1))
     done
     if ! can_iface_of_spidev "$spidev" >/dev/null 2>&1; then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "bind_no_netdev" "$now"
         return 1
     fi
@@ -637,11 +662,11 @@ _wd_rebind_recover() {
     can_pin_name "$spidev" "$ifn"
     local pin_rc=$?
     if (( pin_rc == 2 )); then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "pin_name_collision" "$now"
         return 1
     elif (( pin_rc != 0 )); then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "pin_name_failed" "$now"
         return 1
     fi
@@ -649,7 +674,7 @@ _wd_rebind_recover() {
     can_setup_iface "$ifn"
     local setup_rc=$?
     if (( setup_rc != 0 )); then
-        can_unlock
+        can_unlock || true
         _wd_mark_degraded "$ifn" "setup_failed" "$now"
         return 1
     fi
@@ -658,7 +683,7 @@ _wd_rebind_recover() {
     _WD_IFSTATE[BUSOFF_NORX_STREAK]=0
     _WD_IFSTATE[REBIND_VERIFY_UNTIL]=$((now + ${WD_STALL_VERIFY_S:-10}))
 
-    can_unlock
+    can_unlock || true
     # §1c step 6: dependent-unit restarts happen AFTER can_unlock.
     _wd_restart_dependent_units
     _wd_log_force notice "$ifn" rebind_recovered "$now" "spidev=$spidev"
@@ -755,7 +780,7 @@ _wd_startup_bind_check() {
         can_run_bounded "${WD_REBIND_TIMEOUT_S:-10}" bash -c 'echo "$0" >"$1"' "$spidev" "$bind_file"
         local rc=$?
         if (( rc != 0 )); then
-            can_unlock
+            can_unlock || true
             _wd_mark_degraded "$want" "bind_failed_at_startup" "$now"
             continue
         fi
@@ -767,7 +792,7 @@ _wd_startup_bind_check() {
             waited=$((waited + 1))
         done
         if ! can_iface_of_spidev "$spidev" >/dev/null 2>&1; then
-            can_unlock
+            can_unlock || true
             _wd_mark_degraded "$want" "bind_no_netdev" "$now"
             continue
         fi
@@ -775,17 +800,26 @@ _wd_startup_bind_check() {
         can_pin_name "$spidev" "$want"
         local pin_rc=$?
         if (( pin_rc == 2 )); then
-            can_unlock
+            can_unlock || true
             _wd_mark_degraded "$want" "pin_name_collision" "$now"
             continue
         elif (( pin_rc != 0 )); then
-            can_unlock
+            can_unlock || true
             _wd_mark_degraded "$want" "pin_name_failed" "$now"
             continue
         fi
 
-        can_setup_iface "$want"
-        can_unlock
+        # L-4/L-5: §1d also covers a setup failure during startup
+        # reconciliation, not just bind/pin failures above - and
+        # can_setup_iface's result must not be dropped on the floor (lib
+        # convention: only can_read_conf/can_unpause/can_log/can_now are
+        # safe to call bare).
+        if can_setup_iface "$want"; then
+            can_unlock || true
+        else
+            can_unlock || true
+            _wd_mark_degraded "$want" "setup_failed_at_startup" "$now"
+        fi
     done
 }
 

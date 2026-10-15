@@ -220,6 +220,36 @@ rc_marker_handling=0
 [[ -f "$CAN_TOOLS_RUN_DIR/degraded_can1" ]] && rc_marker_handling=1
 check $rc_marker_handling "a stale (non-D-state) inflight marker for an already-bound iface must not mark it degraded"
 
+echo "=== startup: can_setup_iface failure during startup bind -> degraded with setup_failed_at_startup (L-4) ==="
+reset_all
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+# Deliberately do NOT (re)create $CAN_TOOLS_FAKE_DIR/can1/{state,config}:
+# reset_all does not wipe CAN_TOOLS_FAKE_DIR (only run/state/sysfs), so an
+# earlier test's can1 fixture would otherwise still be sitting there -
+# remove it so tests/fakes/ip's "link set <if> up/down/txqueuelen" has
+# nothing to find and fails for can1 here, exactly the §1d
+# startup-reconciliation equivalent of a setup failure that was previously
+# dropped on the floor by a bare `can_setup_iface "$want"` (L-4/L-5).
+rm -rf "$CAN_TOOLS_FAKE_DIR/can1"
+echo 7000 >"$CAN_TOOLS_FAKE_TIME_FILE"
+write_scenario 1 "can0 10 10 0 0 3" "can1 10 0 0 0 4"
+# write_scenario's _sync_driver_links gives every spidev with a netdev a
+# driver symlink (mirroring "already bound"); strip can1's to put it back
+# into "needs (re)bind" for the startup reconciliation check (§1/M1), while
+# its netdev stays enumerated under the spidev - so can_iface_of_spidev and
+# can_pin_name (current==want, no rename needed) both succeed immediately,
+# and can_setup_iface is the only step that fails.
+rm -f "$CAN_TOOLS_SYSFS_ROOT/bus/spi/devices/spi1.0/driver"
+out=$("$repo_root/can_watchdog.sh" --once 2>&1)
+echo "$out" | grep -q "reason=setup_failed_at_startup"
+check $? "a can_setup_iface failure during startup bind should be logged as setup_failed_at_startup (L-4)"
+dsfs=0; [[ -f "$CAN_TOOLS_RUN_DIR/degraded_can1" ]] || dsfs=1
+check $dsfs "a startup can_setup_iface failure should mark the iface degraded, not silently drop it (§1d, L-4/L-5)"
+grep -q ":setup_failed_at_startup$" "$CAN_TOOLS_RUN_DIR/degraded_can1" 2>/dev/null
+check $? "the degraded marker should record the setup_failed_at_startup reason"
+mkdir -p "$CAN_TOOLS_FAKE_DIR/can1"  # restore the fixture dir later tests rely on
+
 echo "=== can_pin_name collision during rebind -> degraded, no swap (e2e via direct sysfs manipulation) ==="
 reset_all
 echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"

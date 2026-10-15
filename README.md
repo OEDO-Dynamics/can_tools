@@ -204,9 +204,9 @@ exception, and it is intentional (`can_monitor` is retired).
 
 See the warning in "Applying configuration changes" above and
 [`docs/can_watchdog.md`](docs/can_watchdog.md#configuration-is-re-read-live-the-dangerous-part):
-`can_watchdog` re-reads the conf **every cycle**, not at reboot. Some keys
-(`WD_*`, `CAN_FLUSH_IFACES`, `CAN_DEPENDENT_UNITS`) take effect immediately
-and safely. Changing `CAN_RESTART_MS` / `CAN_BERR_REPORTING` / `CAN_FD` makes
+`can_watchdog` re-reads the conf **every cycle**, not at reboot, so **never
+edit the conf while the machine is running** - no key is safe to change live
+(e.g. adding `can1` to `CAN_FLUSH_IFACES` can down/up a live `can1`). Changing `CAN_RESTART_MS` / `CAN_BERR_REPORTING` / `CAN_FD` makes
 the watchdog detect a mismatch against the still-running kernel settings and
 switch that interface to **observe-only** (`reason=config_mismatch_reboot_required`)
 until a reboot (or a machine-stopped `canhat_fd_setup.service` restart)

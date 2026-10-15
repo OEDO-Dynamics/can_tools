@@ -25,9 +25,9 @@ a list of keys that are safe to touch live. There is no such list: even a
 key that the watchdog itself applies harmlessly (`WD_*`) can reach a script
 that is not harmless (`CAN_FLUSH_IFACES` feeds straight into a down/up of
 whatever interface you add to it - see below), and `CAN_IFACES`/
-`CAN_SPI_MAP` are read by `canhat_fd_rename.bash`/`enable_canhat_fd.sh` at
-boot, not by the watchdog's per-cycle reread at all, so there is no
-mismatch-detection safety net for them either way. Edit the conf only with
+`CAN_SPI_MAP` are read at boot by `canhat_fd_rename.bash`/`enable_canhat_fd.sh`
+*and* every cycle by the watchdog (see below), with no mismatch-detection
+safety net for them. Edit the conf only with
 the machine mechanically stopped, then reboot (or, still stopped, restart
 `canhat_fd_setup.service`) right after.
 

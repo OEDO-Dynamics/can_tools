@@ -281,6 +281,30 @@ Examples:
 EOF
 }
 
+# L-3: decide the restart-ms to use when enabling berr-reporting for
+# capture. Defined outside the execution guard below (same reasoning as
+# diag_classify_line() above) so tests can source this file and call it
+# directly with crafted inputs, without needing a states_file/`ip` fake to
+# reach the "original restart-ms could not be read" branch end-to-end.
+# $1: the original restart-ms observed for this iface ("" if unknown/unread).
+# $2: the lib's CAN_RESTART_MS (reflects conf, via can_read_conf).
+# Writes the chosen value to _DIAG_RESTART_MS_RESULT and whether it is a
+# fallback (1) or the genuine original (0) to _DIAG_RESTART_MS_FELL_BACK -
+# globals instead of a `$(...)` echo, same allocation-free convention as
+# _DIAG_RESULT above.
+_DIAG_RESTART_MS_RESULT=""
+_DIAG_RESTART_MS_FELL_BACK=0
+_diag_resolve_restart_ms() {
+    local orig="$1" lib_default="$2"
+    if [[ -n "$orig" ]]; then
+        _DIAG_RESTART_MS_RESULT="$orig"
+        _DIAG_RESTART_MS_FELL_BACK=0
+    else
+        _DIAG_RESTART_MS_RESULT="$lib_default"
+        _DIAG_RESTART_MS_FELL_BACK=1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Execution (only when run directly, never when sourced by tests)
 # ---------------------------------------------------------------------------
@@ -492,8 +516,17 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         # here. can_lock is the actual serialization point: re-verify (and,
         # if needed, re-assert) that a pause is genuinely active now that we
         # hold it, so we never sample berr-reporting output while unpaused.
+        # L-4 (align with M1): if the re-assert itself fails, abort right
+        # here rather than silently continuing unpaused - we already hold
+        # the lock but have not touched any interface yet, so `exit 1` via
+        # the cleanup trap releases it (and the pause we did set) without
+        # leaving any interface changed.
         if ! can_pause_active; then
-            can_pause 2 || true
+            if ! can_pause 2; then
+                echo "ERROR: failed to re-assert watchdog pause after acquiring can_lock; aborting without changes" >&2
+                exit 1
+            fi
+            echo "[can_diag] NOTICE: watchdog pause had lapsed after acquiring can_lock; re-asserted it" >&2
         fi
         _our_pause_deadline=$(cat "$_pause_file" 2>/dev/null || true)
 
@@ -548,7 +581,16 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             # (possibly down, or up with berr-reporting on), with no pause
             # and no further attempt to fix it.
             _berr_ifaces+=("$_diag_if")
-            if CAN_RESTART_MS="${_orig_restart_ms[$_diag_if]:-100}" \
+            # L-3: fall back to the lib's CAN_RESTART_MS (already populated
+            # by can_read_conf in main(), so it reflects conf - not a
+            # hardcoded guess) when the original restart-ms could not be
+            # read from `ip -d link show`, and say so.
+            _diag_resolve_restart_ms "${_orig_restart_ms[$_diag_if]:-}" "$CAN_RESTART_MS"
+            local _diag_restart_ms="$_DIAG_RESTART_MS_RESULT"
+            if (( _DIAG_RESTART_MS_FELL_BACK )); then
+                echo "$_diag_if: could not read original restart-ms; using configured CAN_RESTART_MS=${CAN_RESTART_MS}" >>"$diag_file"
+            fi
+            if CAN_RESTART_MS="$_diag_restart_ms" \
                CAN_FD="${_orig_fd[$_diag_if]:-off}" \
                CAN_BERR_REPORTING=on \
                CAN_BITRATE="${CAN_BITRATE:-250000}" \

@@ -1,6 +1,12 @@
 name: shellcheck
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   shellcheck:
@@ -18,37 +24,30 @@ jobs:
 
           # Run shellcheck on repo-root *.sh and *.bash files, tests/
           # Exclude can-utils/, openimu/
-          # Exclude files that will be modified in later PRs (PR-A2, PR-B):
-          #   - canhat_fd_setup.bash
-          #   - canhat_fd_rename.bash
-          #   - enable_canhat_fd.sh
-          #   - can_monitor.sh
-          # (These exclusions will be removed in PR-D / #9)
 
           echo "=== Running shellcheck -S warning ==="
 
           # Build file list
           files=()
 
-          # Add repo-root *.sh and *.bash (excluding excluded patterns)
+          # Add repo-root *.sh and *.bash
           while IFS= read -r f; do
-              basename="$(basename "$f")"
-              # Skip files to be modified in later PRs (PR-A2, PR-B)
-              if [[ "$basename" == "canhat_fd_setup.bash" ]] || \
-                 [[ "$basename" == "canhat_fd_rename.bash" ]] || \
-                 [[ "$basename" == "enable_canhat_fd.sh" ]] || \
-                 [[ "$basename" == "can_monitor.sh" ]]; then
-                  continue
-              fi
               files+=("$f")
           done < <(find . -maxdepth 1 -type f \( -name "*.sh" -o -name "*.bash" \) ! -path "./can-utils/*" ! -path "./openimu/*" | sort)
 
-          # Add tests/ files: test_*.sh/bash and tests/fakes/* (bash scripts without extension)
+          # Add tests/ files: tests/run.sh, test_*.sh/bash, fakes/*, diag_fakes/* (all shell scripts)
           while IFS= read -r f; do
-              if [[ "$f" == "tests/test_"* ]] || [[ "$f" == "tests/fakes/"* ]]; then
-                  files+=("$f")
+              if [[ -f "$f" ]] && {
+                  [[ "$f" == "tests/run.sh" ]] || \
+                  [[ "$f" == "tests/test_"* ]] || \
+                  [[ "$f" == "tests/fakes/"* ]] || \
+                  [[ "$f" == "tests/diag_fakes/"* ]]; }; then
+                  # Only add if it's a shell script (has shell shebang or is *.sh/*.bash)
+                  if head -1 "$f" 2>/dev/null | grep -q '^#!' || [[ "$f" =~ \.(sh|bash)$ ]]; then
+                      files+=("$f")
+                  fi
               fi
-          done < <(find tests/ -type f \( -name "*.sh" -o -name "*.bash" -o -path "tests/fakes/*" \) | sort)
+          done < <(find tests/ -type f 2>/dev/null | sort)
 
           if (( ${#files[@]} > 0 )); then
               shellcheck -S warning "${files[@]}"

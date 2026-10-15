@@ -301,6 +301,79 @@ run_lock_contention() {
 }
 
 # ---------------------------------------------------------------------------
+# Test 5b: a pause that lapses in the gap between can_pause (M1) and
+# can_lock is re-asserted once the lock is held (M2), with a one-line NOTICE
+# - and if the re-assert itself ever failed, can_diag.sh must abort (L-4,
+# aligned with M1) rather than silently sampling berr-reporting unpaused.
+# This exercises the success side of that re-assert (the only side
+# reachable without faking can_pause's own write failing, which the lib
+# itself always swallows into a `return 0` for a valid numeric argument).
+# ---------------------------------------------------------------------------
+run_pause_reassert_after_lock_race() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_FAKE_TIME_FILE="$tmpdir/time"
+    echo "1700000000" >"$CAN_TOOLS_FAKE_TIME_FILE"
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+    mkdir -p "$tmpdir/sys/class/net/can0/statistics"
+    local f
+    for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+        echo "0" >"$tmpdir/sys/class/net/can0/statistics/$f"
+    done
+
+    echo "Testing can_diag.sh re-asserts a lapsed pause after acquiring can_lock (M2/L-4), instead of silently continuing unpaused..."
+
+    # Hold the lock externally first, so can_diag.sh's own can_pause (M1,
+    # BEFORE the lock) succeeds and writes the pause file, but its can_lock
+    # call then blocks - giving us a window to delete that pause file and
+    # simulate "another process cleared it in the gap", exactly the race
+    # M2's comment describes.
+    (
+        exec 9>"$tmpdir/run/lock"
+        flock -x 9
+        sleep 2
+    ) &
+    local holder_pid=$!
+    sleep 0.3  # let the holder actually acquire the flock first
+
+    ( cd "$repo_dir" && bash can_diag.sh 3 >"$tmpdir/out.log" 2>"$tmpdir/err.log" ) &
+    local diag_pid=$!
+
+    # Wait for can_diag.sh's M1 pause to land, then clear it while it is
+    # still blocked on can_lock (held by $holder_pid above).
+    local waited=0
+    while [[ ! -f "$tmpdir/run/watchdog.pause" ]] && (( waited < 50 )); do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [[ -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "can_diag.sh's initial M1 pause should be visible while it waits for can_lock"
+    rm -f "$tmpdir/run/watchdog.pause"
+
+    wait "$holder_pid" 2>/dev/null
+    wait "$diag_pid" 2>/dev/null
+    local rc=$?
+    check "$rc" "can_diag.sh should still complete successfully after re-asserting a lapsed pause (got rc=$rc)"
+
+    grep -q "watchdog pause had lapsed after acquiring can_lock; re-asserted it" "$tmpdir/err.log"
+    check $? "a lapsed pause found after can_lock should log a one-line NOTICE, not continue silently (L-4/M2)"
+
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "the re-asserted pause should still be cleaned up normally on exit"
+
+    rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
 # Test 6: a hanging `ip` must not hang can_diag.sh (H3)
 # ---------------------------------------------------------------------------
 run_ip_hang() {
@@ -550,6 +623,7 @@ run_invalid_args
 run_sigterm
 run_sigint
 run_lock_contention
+run_pause_reassert_after_lock_race
 run_ip_hang
 run_sigterm_during_berr_setup
 run_double_sigterm

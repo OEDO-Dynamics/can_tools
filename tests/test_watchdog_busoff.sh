@@ -162,6 +162,40 @@ got_backoff4=$(grep -m1 "^BUSOFF_BACKOFF_S=" "$CAN_TOOLS_RUN_DIR/wd_can0.state" 
 cb4=0; [[ "$got_backoff4" == "30" ]] || cb4=1
 check $cb4 "the storm's forced max backoff must persist across a later out-of-quiet-window bus-off, got BUSOFF_BACKOFF_S=$got_backoff4"
 
+echo "=== L-5: busoff_total_<if> is a true cumulative count, surviving the storm-window prune ==="
+# The 3 storm-test recoveries above each ran outside WD_BUSOFF_QUIET_S, so
+# each one reached the real down/up recovery path (not just a deferred
+# backoff) and should have bumped the cumulative counter once.
+total_after_3=$(cat "$CAN_TOOLS_STATE_DIR/busoff_total_can0" 2>/dev/null || echo 0)
+cond_total1=0; [[ "$total_after_3" == "3" ]] || cond_total1=1
+check $cond_total1 "busoff_total_can0 should be 3 after 3 real recoveries (got: $total_after_3)"
+# The 4th occurrence (storm still active -> forced max backoff) only ARMS a
+# deferred recovery this cycle (same as the normal backoff-gating test
+# above); it must not double-count a bus-off that has not actually been
+# recovered yet, same as busoff_times_<if> itself only growing on the real
+# down/up path.
+total_after_4=$(cat "$CAN_TOOLS_STATE_DIR/busoff_total_can0" 2>/dev/null || echo 0)
+cond_total2=0; [[ "$total_after_4" == "3" ]] || cond_total2=1
+check $cond_total2 "busoff_total_can0 must not increment for a bus-off deferred by the storm backoff, not yet actually recovered (got: $total_after_4)"
+
+echo "=== L-5: _wd_snapshot reports both the storm-windowed busoff= and the cumulative busoff_total= ==="
+# _wd_snapshot (like every other _wd_* helper here) reads the process-global
+# _WD_STATE_DIR, which is only populated by _wd_init_dirs - never called yet
+# in THIS shell, since every can_watchdog.sh invocation above ran as its own
+# subprocess. Call it directly, exactly as _wd_cycle itself does.
+_wd_init_dirs
+mkdir -p "$CAN_TOOLS_STATE_DIR"
+echo "100" >"$CAN_TOOLS_STATE_DIR/busoff_total_can0"
+# Seed busoff_times_can0 directly so busoff= (read with the effectively
+# unbounded window _wd_snapshot itself uses) is independently verifiable,
+# decoupled from busoff_total_can0 - the two must NOT be forced equal.
+printf '9000\n9001\n' >"$CAN_TOOLS_STATE_DIR/busoff_times_can0"
+snap=$(_wd_snapshot can0 9500)
+echo "$snap" | grep -q "busoff=2 "
+check $? "the snapshot's busoff= should reflect busoff_times_can0 (got: $snap)"
+echo "$snap" | grep -q "busoff_total=100$"
+check $? "the snapshot should also report the cumulative busoff_total=, decoupled from busoff= (L-5) (got: $snap)"
+
 echo "=== post-recovery short stall window: only WD_STALL_POST_BUSOFF_CONSEC cycles needed ==="
 reset_all
 echo "BUS-OFF" >"$CAN_TOOLS_FAKE_DIR/can0/state"

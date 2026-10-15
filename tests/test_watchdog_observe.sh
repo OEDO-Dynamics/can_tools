@@ -52,6 +52,24 @@ WD_PAUSE_WARN_S=600
 EOF
 }
 
+# M1: can_watchdog.sh's startup reconciliation now decides "needs bind"
+# from the presence/absence of a /sys/bus/spi/devices/<spidev>/driver
+# symlink (matching real kernel sysfs), not from whether a netdev happens
+# to be visible yet. tests/fakes/mk_sysfs.sh (shared, not modified by this
+# PR) does not model that symlink, so each write_scenario call here
+# synthesizes it itself for every spidev that currently has a netdev under
+# it - exactly mirroring what the real kernel does for an actually-bound
+# device. This is local test fixture setup, not a change to tests/fakes/.
+_sync_driver_links() {
+    local d
+    for d in "$CAN_TOOLS_SYSFS_ROOT"/bus/spi/devices/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -n "$(ls -A "$d/net" 2>/dev/null)" ]]; then
+            [[ -e "${d}driver" ]] || ln -s "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd" "${d}driver"
+        fi
+    done
+}
+
 write_scenario() {
     local tick="$1"
     shift
@@ -62,6 +80,7 @@ write_scenario() {
         echo "$tick $line" >>"$f"
     done
     "$repo_root/tests/fakes/mk_sysfs.sh" "$f" "$tick"
+    _sync_driver_links
 }
 
 echo "=== config mismatch -> observe-only (no recovery action, WARNING logged) ==="
@@ -139,6 +158,53 @@ done
 check $? "can1 is not in default CAN_FLUSH_IFACES (can0) and must never be flushed"
 grep -q "link set can0 up" "$CAN_TOOLS_FAKE_DIR/calls.log" 2>/dev/null
 check $? "sanity: can0 (in CAN_FLUSH_IFACES) should have been flushed under the same stale condition"
+
+echo "=== R5: stall detected while observe-only (config mismatch) -> CRIT, no recovery action ==="
+reset_env
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=100 berr=off fd=on admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"  # mismatched vs conf (0/off/off)
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can1/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can1/config"
+t=1000
+for n in 1 2 3 4; do
+    echo "$t" >"$CAN_TOOLS_FAKE_TIME_FILE"
+    write_scenario "$n" "can0 100 100 $((n * 5)) 0 3" "can1 100 0 0 0 4"
+    out=$("$repo_root/can_watchdog.sh" --once 2>&1)
+    t=$((t + 1))
+done
+echo "$out" | grep -q "reason=stall_detected_observe_only"
+check $? "stall evidence while observe-only (config mismatch) should log stall_detected_observe_only (R5)"
+ub=0; [[ ! -s "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd/unbind" ]] || ub=1
+check $ub "observe-only stall detection must not actually attempt a rebind"
+cde=0; [[ ! -f "$CAN_TOOLS_RUN_DIR/degraded_can0" ]] || cde=1
+check $cde "observe-only stall detection must not mark the iface degraded either"
+
+echo "=== L4: an iface configured but absent from ip's output logs iface_missing ==="
+reset_env
+rm -f "$CAN_TOOLS_FAKE_DIR/can1/state" "$CAN_TOOLS_FAKE_DIR/can1/config"
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+echo 1000 >"$CAN_TOOLS_FAKE_TIME_FILE"
+f="$tmpdir/scenario_missing.txt"
+echo "1 can0 50 50 0 0 3" >"$f"
+"$repo_root/tests/fakes/mk_sysfs.sh" "$f" 1
+out=$("$repo_root/can_watchdog.sh" --once 2>&1)
+echo "$out" | grep -q "iface=can1 reason=iface_missing"
+check $? "an iface missing from ip's output should log a WARNING reason=iface_missing (L4)"
+
+echo "=== L5: an expired (but still present) pause file logs pause_expired ==="
+reset_env
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can1/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can1/config"
+mkdir -p "$CAN_TOOLS_RUN_DIR"
+echo "500" >"$CAN_TOOLS_RUN_DIR/watchdog.pause"   # a deadline well in the past
+echo 1000 >"$CAN_TOOLS_FAKE_TIME_FILE"
+write_scenario 1 "can0 50 50 0 0 3" "can1 50 0 0 0 4"
+out=$("$repo_root/can_watchdog.sh" --once 2>&1)
+echo "$out" | grep -q "reason=pause_expired"
+check $? "an expired pause file should log a WARNING reason=pause_expired (L5), not just silently resume"
 
 echo ""
 echo "Observe-only tests: $pass passed, $fail failed"

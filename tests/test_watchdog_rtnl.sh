@@ -70,6 +70,18 @@ cat >"$f" <<'EOF'
 EOF
 "$repo_root/tests/fakes/mk_sysfs.sh" "$f" 1
 
+# M1: can_watchdog.sh's startup reconciliation now looks for a
+# /sys/bus/spi/devices/<spidev>/driver symlink (matching real kernel
+# sysfs) to decide an iface is already bound, rather than just checking
+# for a visible netdev. tests/fakes/mk_sysfs.sh does not model that
+# symlink, so without this both ifaces would look "unbound" every cycle
+# and the startup path's own can_setup_iface call (which goes through the
+# hung fake ip) would fight the main loop's can_iface_states call for the
+# single can_run_bounded slot this test is specifically exercising.
+for d in "$CAN_TOOLS_SYSFS_ROOT"/bus/spi/devices/*/; do
+    [[ -n "$(ls -A "$d/net" 2>/dev/null)" ]] && ln -sf "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd" "${d}driver"
+done
+
 echo "=== real daemon loop: hung ip must not accumulate one D-state child per cycle, and 3 timeouts degrade everything ==="
 "$repo_root/can_watchdog.sh" >/dev/null 2>&1 &
 wd_pid=$!

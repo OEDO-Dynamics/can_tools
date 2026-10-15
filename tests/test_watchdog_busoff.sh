@@ -57,6 +57,24 @@ EOF
 # shellcheck source=/dev/null
 source "$repo_root/can_watchdog.sh"
 
+# M1: can_watchdog.sh's startup reconciliation now decides "needs bind"
+# from the presence/absence of a /sys/bus/spi/devices/<spidev>/driver
+# symlink (matching real kernel sysfs), not from whether a netdev happens
+# to be visible yet. tests/fakes/mk_sysfs.sh (shared, not modified by this
+# PR) does not model that symlink, so each write_scenario call here
+# synthesizes it itself for every spidev that currently has a netdev under
+# it - exactly mirroring what the real kernel does for an actually-bound
+# device. This is local test fixture setup, not a change to tests/fakes/.
+_sync_driver_links() {
+    local d
+    for d in "$CAN_TOOLS_SYSFS_ROOT"/bus/spi/devices/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -n "$(ls -A "$d/net" 2>/dev/null)" ]]; then
+            [[ -e "${d}driver" ]] || ln -s "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd" "${d}driver"
+        fi
+    done
+}
+
 write_scenario() {
     local tick="$1"
     shift
@@ -67,6 +85,7 @@ write_scenario() {
         echo "$tick $line" >>"$f"
     done
     "$repo_root/tests/fakes/mk_sysfs.sh" "$f" "$tick"
+    _sync_driver_links
 }
 
 reset_all() {
@@ -101,7 +120,8 @@ echo 2002 >"$CAN_TOOLS_FAKE_TIME_FILE"   # within WD_BUSOFF_QUIET_S of the first
 up_count_2=$(grep -c "link set can0 up" "$CAN_TOOLS_FAKE_DIR/calls.log")
 cond1=0; [[ "$up_count_1" == "1" && "$up_count_2" == "1" ]] || cond1=1
 check $cond1 "a 2nd bus-off right after the 1st should not execute down/up immediately (1s backoff pending), got $up_count_1 then $up_count_2"
-backoff_val=$(_wd_state_get can0 BUSOFF_BACKOFF_S 0)
+backoff_val=$(grep -m1 "^BUSOFF_BACKOFF_S=" "$CAN_TOOLS_RUN_DIR/wd_can0.state" 2>/dev/null | cut -d= -f2)
+backoff_val="${backoff_val:-0}"
 cond2=0; [[ "$backoff_val" == "1" ]] || cond2=1
 check $cond2 "backoff should have escalated to 1s for the pending recovery, got $backoff_val"
 
@@ -125,6 +145,23 @@ done
 echo "$out" | grep -q "reason=busoff_storm"
 check $? "the 3rd bus-off within WD_STORM_WINDOW_S (with WD_STORM_COUNT=3) should log busoff_storm CRIT"
 
+# L10(a): the CRIT must not repeat on every subsequent occurrence while the
+# storm condition persists (it is edge-triggered, not just rate-limited).
+t=$((t + 15))
+echo "$t" >"$CAN_TOOLS_FAKE_TIME_FILE"
+write_scenario 4 "can0 50 50 0 0 3" "can1 50 0 0 0 4"
+out4=$("$repo_root/can_watchdog.sh" --once 2>&1)
+nr=0; echo "$out4" | grep -q "reason=busoff_storm" && nr=1
+check $nr "a 4th bus-off, storm still active, must NOT log busoff_storm again (L10: once per storm, not per occurrence)"
+
+# L10(b): the forced max backoff must persist even though this 4th
+# occurrence falls OUTSIDE WD_BUSOFF_QUIET_S of the 3rd - previously the
+# normal quiet-window reset (last_ts far enough away -> backoff_s=0)
+# silently undid the storm cap.
+got_backoff4=$(grep -m1 "^BUSOFF_BACKOFF_S=" "$CAN_TOOLS_RUN_DIR/wd_can0.state" 2>/dev/null | cut -d= -f2)
+cb4=0; [[ "$got_backoff4" == "30" ]] || cb4=1
+check $cb4 "the storm's forced max backoff must persist across a later out-of-quiet-window bus-off, got BUSOFF_BACKOFF_S=$got_backoff4"
+
 echo "=== post-recovery short stall window: only WD_STALL_POST_BUSOFF_CONSEC cycles needed ==="
 reset_all
 echo "BUS-OFF" >"$CAN_TOOLS_FAKE_DIR/can0/state"
@@ -141,6 +178,86 @@ write_scenario 3 "can0 50 50 4 0 3" "can1 50 0 0 0 4"
 out=$("$repo_root/can_watchdog.sh" --once 2>&1)
 echo "$out" | grep -q "reason=rebind_recovered"
 check $? "within the 5s post-busoff window, only 2 (not 3) consecutive stall cycles should trigger a rebind"
+
+echo "=== settle not converging -> no down/up this cycle, deferred to the next ==="
+# Deterministic (no real-time race): WD_SETTLE_MAX_MS smaller than one full
+# WD_SETTLE_SAMPLE_MS interval means _wd_settle structurally cannot observe
+# 2 consecutive equal samples before its budget runs out, regardless of
+# whether rx_packets is actually stable - directly exercising the "settle
+# never converges" path without depending on timing-sensitive background
+# churn to keep the value moving.
+reset_all
+cat >>"$CAN_TOOLS_CONF" <<'EOF'
+WD_SETTLE_SAMPLE_MS=50
+WD_SETTLE_MAX_MS=10
+EOF
+echo "BUS-OFF" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+echo 6000 >"$CAN_TOOLS_FAKE_TIME_FILE"
+write_scenario 1 "can0 50 50 0 0 3" "can1 50 0 0 0 4"
+out=$("$repo_root/can_watchdog.sh" --once 2>&1)
+echo "$out" | grep -q "reason=busoff_settle_timeout"
+check $? "settle exceeding WD_SETTLE_MAX_MS should log busoff_settle_timeout"
+cnd=0; grep -q "link set can0 down" "$CAN_TOOLS_FAKE_DIR/calls.log" 2>/dev/null && cnd=1
+check $cnd "a bus-off whose settle does not converge must not be brought down/up this cycle"
+# Restore the fast settle params the rest of this file relies on.
+cat >"$CAN_TOOLS_CONF" <<'EOF'
+CAN_RESTART_MS=0
+CAN_BERR_REPORTING=off
+CAN_FD=off
+WD_SETTLE_SAMPLE_MS=5
+WD_SETTLE_MAX_MS=20
+WD_BUSOFF_QUIET_S=10
+WD_BUSOFF_BACKOFF_MAX_S=30
+WD_STORM_COUNT=3
+WD_STORM_WINDOW_S=60
+WD_STALL_POST_BUSOFF_WINDOW_S=5
+WD_STALL_POST_BUSOFF_CONSEC=2
+EOF
+
+echo "=== bus-off backoff sequence: 0 (settle only), then 1, 2, 4, ..., capped at WD_BUSOFF_BACKOFF_MAX_S ==="
+# Each doubling step is verified in isolation by seeding
+# BUSOFF_BACKOFF_S/BUSOFF_LAST_RECOVERY_TS directly (same technique as the
+# flush backoff gating test above) rather than threading one continuous
+# multi-cycle simulation through real --once calls: with a persistently
+# BUS-OFF iface, every single cycle (including the "wait and recheck" ones)
+# is itself another busoff occurrence, so the wall-clock bookkeeping for a
+# long chained sequence gets entangled with itself. Seeding isolates exactly
+# "given backoff was N and the last recovery was within the quiet window,
+# what does the NEXT escalation compute" for each step independently.
+_seed_busoff_state() {
+    local ifn="$1" key="$2" val="$3"
+    local f="$CAN_TOOLS_RUN_DIR/wd_${ifn}.state"
+    mkdir -p "$(dirname "$f")"
+    touch "$f"
+    grep -v "^${key}=" "$f" >"$f.tmp" 2>/dev/null || true
+    echo "${key}=${val}" >>"$f.tmp"
+    mv "$f.tmp" "$f"
+}
+reset_all
+echo "BUS-OFF" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+seq_ok=1
+prev_backoff=0
+now_ts=10000
+for expect_next in 1 2 4 8 16 30 30; do
+    write_scenario "y$now_ts" "can0 50 50 0 0 3" "can1 50 0 0 0 4"
+    echo "$now_ts" >"$CAN_TOOLS_FAKE_TIME_FILE"
+    "$repo_root/can_watchdog.sh" --once >/dev/null 2>&1   # establish PREV_* / settle baseline
+    _seed_busoff_state can0 BUSOFF_BACKOFF_S "$prev_backoff"
+    _seed_busoff_state can0 BUSOFF_LAST_RECOVERY_TS "$((now_ts - 1))"  # within WD_BUSOFF_QUIET_S
+    _seed_busoff_state can0 BUSOFF_PENDING_TS 0
+    "$repo_root/can_watchdog.sh" --once >/dev/null 2>&1
+    got_backoff=$(grep -m1 "^BUSOFF_BACKOFF_S=" "$CAN_TOOLS_RUN_DIR/wd_can0.state" 2>/dev/null | cut -d= -f2)
+    got_pending=$(grep -m1 "^BUSOFF_PENDING_TS=" "$CAN_TOOLS_RUN_DIR/wd_can0.state" 2>/dev/null | cut -d= -f2)
+    if [[ "$got_backoff" != "$expect_next" || "$got_pending" != "$((now_ts + expect_next))" ]]; then
+        seq_ok=0
+        echo "  mismatch: prev=$prev_backoff -> got backoff=$got_backoff pending=$got_pending, expected backoff=$expect_next pending=$((now_ts + expect_next))"
+    fi
+    prev_backoff=$expect_next
+    now_ts=$((now_ts + 1000))  # far apart, each step independent of storm/quiet accumulation
+done
+check $((1 - seq_ok)) "bus-off backoff doubling should follow 1,2,4,8,16,30,30 (capped at WD_BUSOFF_BACKOFF_MAX_S)"
 
 echo ""
 echo "Bus-off tests: $pass passed, $fail failed"

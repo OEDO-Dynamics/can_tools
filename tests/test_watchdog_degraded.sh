@@ -7,7 +7,9 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 source "$repo_root/can_tools_lib.bash"
 
 tmpdir=$(mktemp -d)
+wd_pid=""
 cleanup() {
+    [[ -n "$wd_pid" ]] && kill -9 "$wd_pid" 2>/dev/null
     pkill -9 -f can_tools_unbind 2>/dev/null || true
     pkill -9 -f "$repo_root/tests/fakes/ip" 2>/dev/null || true
     rm -rf "$tmpdir"
@@ -48,6 +50,24 @@ EOF
 # shellcheck source=/dev/null
 source "$repo_root/can_watchdog.sh"
 
+# M1: can_watchdog.sh's startup reconciliation now decides "needs bind"
+# from the presence/absence of a /sys/bus/spi/devices/<spidev>/driver
+# symlink (matching real kernel sysfs), not from whether a netdev happens
+# to be visible yet. tests/fakes/mk_sysfs.sh (shared, not modified by this
+# PR) does not model that symlink, so each write_scenario call here
+# synthesizes it itself for every spidev that currently has a netdev under
+# it - exactly mirroring what the real kernel does for an actually-bound
+# device. This is local test fixture setup, not a change to tests/fakes/.
+_sync_driver_links() {
+    local d
+    for d in "$CAN_TOOLS_SYSFS_ROOT"/bus/spi/devices/*/; do
+        [[ -d "$d" ]] || continue
+        if [[ -n "$(ls -A "$d/net" 2>/dev/null)" ]]; then
+            [[ -e "${d}driver" ]] || ln -s "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd" "${d}driver"
+        fi
+    done
+}
+
 write_scenario() {
     local tick="$1"
     shift
@@ -58,6 +78,7 @@ write_scenario() {
         echo "$tick $line" >>"$f"
     done
     "$repo_root/tests/fakes/mk_sysfs.sh" "$f" "$tick"
+    _sync_driver_links
 }
 
 reset_all() {
@@ -199,17 +220,35 @@ rc_marker_handling=0
 [[ -f "$CAN_TOOLS_RUN_DIR/degraded_can1" ]] && rc_marker_handling=1
 check $rc_marker_handling "a stale (non-D-state) inflight marker for an already-bound iface must not mark it degraded"
 
-# NOTE (gap, see PR body 確認事項): a rebind that lands on a name already
-# taken by a DIFFERENT, still-bound netdev (can_pin_name returning 2) is not
-# exercised end to end here. Reproducing it needs the rebound netdev's name
-# collision to come from a genuinely separate spidev that the test can leave
-# untouched; tests/fakes/ip's `link show <name>` only resolves against
-# CAN_TOOLS_FAKE_DIR, and pointing it at a case shaped like "can1 ends up
-# wanting a name can1 already has elsewhere" needs a small fakes extension
-# (e.g. letting `link show` resolve a name whose fake directory predates the
-# spidev remap). _wd_rebind_recover's pin_rc==2 branch (mark degraded,
-# no swap) is covered directly by reading the code and by can_pin_name's own
-# collision-branch unit test in tests/test_lib_core.sh.
+echo "=== can_pin_name collision during rebind -> degraded, no swap (e2e via direct sysfs manipulation) ==="
+reset_all
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can1/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can1/config"
+for n in 1 2 3; do
+    echo "$((1000 + n))" >"$CAN_TOOLS_FAKE_TIME_FILE"
+    write_scenario "$n" "can0 100 100 0 0 3" "can1 100 0 $((n * 5)) 0 4"
+    "$repo_root/can_watchdog.sh" --once >/dev/null 2>&1
+done
+# Simulate: by the time this rebind's bind+netdev-wait step runs, the kernel
+# has enumerated the new netdev as "can2" (e.g. because "can1" was still
+# momentarily held elsewhere) rather than "can1" - the spidev's net/ entry
+# now points at can2, while a stale "can1" fake dir (state/config) is still
+# present and resolvable by `ip link show can1`, exactly reproducing a real
+# naming collision for can_pin_name to catch.
+mkdir -p "$CAN_TOOLS_SYSFS_ROOT/class/net/can2"
+rm -f "$CAN_TOOLS_SYSFS_ROOT/bus/spi/devices/spi1.0/net/can1"
+ln -s "$CAN_TOOLS_SYSFS_ROOT/class/net/can2" "$CAN_TOOLS_SYSFS_ROOT/bus/spi/devices/spi1.0/net/can2"
+echo 20 >"$CAN_TOOLS_SYSFS_ROOT/class/net/can1/statistics/rx_fifo_errors"
+echo 1004 >"$CAN_TOOLS_FAKE_TIME_FILE"
+out=$("$repo_root/can_watchdog.sh" --once 2>&1)
+echo "$out" | grep -q "reason=pin_name_collision"
+check $? "a post-rebind name collision (can_pin_name rc=2) should be logged as pin_name_collision"
+dpc=0; [[ -f "$CAN_TOOLS_RUN_DIR/degraded_can1" ]] || dpc=1
+check $dpc "a pin_name collision should mark the iface degraded (no swap attempted)"
+grep -q "^1004:pin_name_collision$" "$CAN_TOOLS_RUN_DIR/degraded_can1" 2>/dev/null
+check $? "the degraded marker should record the pin_name_collision reason"
 
 echo "=== periodic degraded CRIT fires every WD_DEGRADED_CRIT_S, not every cycle ==="
 reset_all
@@ -252,6 +291,81 @@ write_scenario 2 "can0 10 10 0 0 3" "can1 10 0 0 0 4"
 out4=$("$repo_root/can_watchdog.sh" --once 2>&1)
 ! echo "$out4" | grep -q "reason=manual_reboot_required"
 check $? "after clearing, the iface should no longer be reported as degraded"
+
+echo "=== real daemon loop: can_lock is released even while the hung unbind child is still alive ==="
+# A check done after a --once process has already exited always "passes"
+# trivially (its own fd 9 closes on exit regardless of what can_unlock did).
+# This drives the real, long-running daemon loop instead, and probes the
+# lock from THIS test process WHILE the watchdog process (and its stuck
+# unbind child) are both still alive. Unset the fake clock first: the rest
+# of this file uses it to drive --once in lockstep, but a real daemon loop
+# must see real wall-clock time advancing, not a value frozen at whatever
+# the last --once call left it at.
+unset CAN_TOOLS_FAKE_TIME_FILE
+reset_all
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can0/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can0/config"
+echo "ERROR-ACTIVE" >"$CAN_TOOLS_FAKE_DIR/can1/state"
+echo "restart_ms=0 berr=off fd=off admin=up" >"$CAN_TOOLS_FAKE_DIR/can1/config"
+write_scenario 1 "can0 100 100 0 0 3" "can1 100 0 0 0 4"
+rm -f "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd/unbind"
+mkfifo "$CAN_TOOLS_SYSFS_ROOT/bus/spi/drivers/mcp251xfd/unbind"
+cat >>"$CAN_TOOLS_CONF" <<'EOF'
+WD_LOOP_S=1
+WD_RTNL_TIMEOUT_S=2
+WD_REBIND_TIMEOUT_S=2
+WD_STALL_CONSEC=2
+EOF
+
+"$repo_root/can_watchdog.sh" >/dev/null 2>"$tmpdir/realloop.log" &
+wd_pid=$!
+
+# Drive can1 into a stall (rx frozen, rxfifo growing) until the unbind hang
+# (and therefore the inflight marker) shows up.
+(
+    v=0
+    while [[ ! -f "$CAN_TOOLS_RUN_DIR/unbind_inflight" ]]; do
+        v=$((v + 5))
+        echo "$v" >"$CAN_TOOLS_SYSFS_ROOT/class/net/can1/statistics/rx_fifo_errors" 2>/dev/null
+        sleep 0.3
+    done
+) &
+churn_pid=$!
+
+marker_present=0
+wd_alive=0
+lock_free=1
+for _ in $(seq 1 80); do
+    if [[ -f "$CAN_TOOLS_RUN_DIR/unbind_inflight" ]]; then
+        # Real kernel sysfs removes the driver symlink as part of starting
+        # an unbind, even if the driver's own .remove() callback then hangs;
+        # this test's local driver-symlink fixture (see _sync_driver_links)
+        # has no such automatic behavior, so mirror it by hand the moment
+        # the inflight marker (written by the unbind child itself) appears
+        # - otherwise M1's "already bound (driver symlink present), leave it
+        # alone" check would keep masking the hung-marker branch on the
+        # watchdog's NEXT cycle (which could otherwise race with and even
+        # remove this marker before the assertions below run).
+        rm -f "$CAN_TOOLS_SYSFS_ROOT/bus/spi/devices/spi1.0/driver"
+        marker_present=1
+        # The marker appears the instant the unbind child starts (it writes
+        # it before blocking), which is well BEFORE the parent's
+        # can_run_bounded gives up waiting (WD_REBIND_TIMEOUT_S=2s) and
+        # calls can_unlock - the lock is legitimately still held until then.
+        # Wait past that timeout (plus slack) before checking the lock, but
+        # still well within the same still-running watchdog process.
+        sleep 3
+        kill -0 "$wd_pid" 2>/dev/null && wd_alive=1
+        flock -n "$CAN_TOOLS_RUN_DIR/lock" true 2>/dev/null || lock_free=0
+        break
+    fi
+    sleep 0.25
+done
+kill "$churn_pid" 2>/dev/null; wait "$churn_pid" 2>/dev/null
+
+check $((1 - marker_present)) "the real-loop unbind hang should leave an inflight marker"
+check $((1 - wd_alive)) "the watchdog process itself should still be alive (not crashed) while its unbind child hangs"
+check $((1 - lock_free)) "can_lock must be released by the watchdog even while its unbind child is still hung (checked from outside, loop still running)"
 
 echo ""
 echo "Degraded-mode tests: $pass passed, $fail failed"

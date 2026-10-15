@@ -30,10 +30,12 @@ jobs:
           # Build file list
           files=()
 
-          # Add repo-root *.sh and *.bash
+          # Add repo-root *.sh and *.bash (can-utils/ and openimu/ are not
+          # matched by -maxdepth 1 in the first place, so no further
+          # exclusion is needed for them).
           while IFS= read -r f; do
               files+=("$f")
-          done < <(find . -maxdepth 1 -type f \( -name "*.sh" -o -name "*.bash" \) ! -path "./can-utils/*" ! -path "./openimu/*" | sort)
+          done < <(find . -maxdepth 1 -type f \( -name "*.sh" -o -name "*.bash" \) | sort)
 
           # Add tests/ files: tests/run.sh, test_*.sh/bash, fakes/*, diag_fakes/* (all shell scripts)
           while IFS= read -r f; do
@@ -42,8 +44,8 @@ jobs:
                   [[ "$f" == "tests/test_"* ]] || \
                   [[ "$f" == "tests/fakes/"* ]] || \
                   [[ "$f" == "tests/diag_fakes/"* ]]; }; then
-                  # Only add if it's a shell script (has shell shebang or is *.sh/*.bash)
-                  if head -1 "$f" 2>/dev/null | grep -q '^#!' || [[ "$f" =~ \.(sh|bash)$ ]]; then
+                  # Only add if it's a shell script (bash/sh shebang, or *.sh/*.bash)
+                  if head -1 "$f" 2>/dev/null | grep -qE '^#!.*\b(ba)?sh\b' || [[ "$f" =~ \.(sh|bash)$ ]]; then
                       files+=("$f")
                   fi
               fi
@@ -51,13 +53,9 @@ jobs:
 
           if (( ${#files[@]} > 0 )); then
               shellcheck -S warning "${files[@]}"
-              rc=$?
           else
               echo "No shell files found to check"
-              rc=0
           fi
-
-          exit $rc
 
       - name: Run tests
         run: |

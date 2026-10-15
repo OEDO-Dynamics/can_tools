@@ -141,11 +141,13 @@ machine that is in operation.
 
 The CAN subsystem starts in this boot sequence order:
 
-1. `canhat_fd_rename.service` (`Type=oneshot`, `After=network.target`) -
-   pins `can0`/`can1` to their physical SPI devices per `CAN_SPI_MAP`
-   (default `spi0.0:can0 spi1.0:can1`) using the lib's `can_pin_name`
-   (`ip link set <iface> down` then `... name <want>`, with a probe-order
-   swap if the two SPI devices enumerate in the opposite order).
+1. `canhat_fd_rename.service` (`Type=oneshot`,
+   `After=sys-subsystem-net-devices-can0.device sys-subsystem-net-devices-can1.device`,
+   `Before=canhat_fd_setup.service docker.service`) - pins `can0`/`can1` to
+   their physical SPI devices per `CAN_SPI_MAP` (default
+   `spi0.0:can0 spi1.0:can1`) using the lib's `can_pin_name` (`ip link set
+   <iface> down` then `... name <want>`, with a probe-order swap if the two
+   SPI devices enumerate in the opposite order).
 2. `canhat_fd_setup.service` (`Type=oneshot`, `After=canhat_fd_rename.service`)
    - brings each interface up via the lib's `can_setup_iface`: `ip link set
    <if> down` then `up type can bitrate ... restart-ms ... berr-reporting ...
@@ -156,9 +158,12 @@ The CAN subsystem starts in this boot sequence order:
    `Wants=canhat_fd_setup.service`, `After=canhat_fd_setup.service`) - the
    resident watchdog described below.
 
-There is **no `Before=` ordering** from `canhat_fd_setup.service` or
-`can_watchdog.service` onto whatever application or container speaks CAN -
-only the `After=` chain above between the three can_tools units themselves.
+`canhat_fd_rename.service` does declare `Before=canhat_fd_setup.service
+docker.service` (so renaming happens before both `canhat_fd_setup.service`
+and `docker.service` start), but there is **no further `Before=` ordering**
+from `canhat_fd_setup.service` or `can_watchdog.service` onto whatever
+application or container speaks CAN - beyond that one `Before=`, only the
+`After=` chain above between the three can_tools units themselves.
 If an app or container needs to start strictly after the interfaces are up
 and the watchdog is running, that has to be arranged on the consumer's own
 unit (or handled by the app's own reconnect-on-ENETDOWN logic; see

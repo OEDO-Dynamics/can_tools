@@ -18,23 +18,41 @@ tracked separately in Issue #10.
 
 ## Configuration is re-read live (the dangerous part)
 
+**Operating rule, no exceptions: never edit `/opt/can_tools/can_tools.conf`
+while the machine is running.** The rest of this section explains *why*, key
+by key - it is background for understanding what the watchdog is doing, not
+a list of keys that are safe to touch live. There is no such list: even a
+key that the watchdog itself applies harmlessly (`WD_*`) can reach a script
+that is not harmless (`CAN_FLUSH_IFACES` feeds straight into a down/up of
+whatever interface you add to it - see below), and `CAN_IFACES`/
+`CAN_SPI_MAP` are read by `canhat_fd_rename.bash`/`enable_canhat_fd.sh` at
+boot, not by the watchdog's per-cycle reread at all, so there is no
+mismatch-detection safety net for them either way. Edit the conf only with
+the machine mechanically stopped, then reboot (or, still stopped, restart
+`canhat_fd_setup.service`) right after.
+
 Every cycle (`_wd_cycle`, called every `WD_LOOP_S`, 1 s by default) calls
-`can_read_conf` unconditionally (`can_watchdog.sh:995`) - the watchdog does
+`can_read_conf` unconditionally (`can_watchdog.sh:1029`) - the watchdog does
 **not** wait for a reboot or a service restart to pick up a conf change the
 way `install.sh`'s own "config changes apply at the next reboot" message
-might suggest for the *interface setup* units. For the watchdog itself:
+might suggest for the *interface setup* units. What actually happens per key:
 
 - **`WD_*`, `CAN_FLUSH_IFACES`, `CAN_DEPENDENT_UNITS`**: take effect on the
-  very next cycle. Safe to edit live if you only touch these.
+  very next watchdog cycle, with no mismatch check and no observe-only
+  fallback. That immediacy is exactly the danger: adding an interface to
+  `CAN_FLUSH_IFACES` while the machine is running means the very next
+  ERROR-WARNING/PASSIVE stall-free window on that interface triggers a live
+  down/up (TX flush) on it - including an interface that was not being
+  flushed a moment ago.
 - **`CAN_RESTART_MS` / `CAN_BERR_REPORTING` / `CAN_FD`**: compared every
   cycle against what `ip -d link show type can` reports is *actually running*
-  on the kernel side (`can_watchdog.sh:882-887`, using the same
+  on the kernel side (`can_watchdog.sh:916-920`, using the same
   `restart_ms=`/`berr=`/`fd=` fields `can_iface_states` already parsed out of
   one `ip -d link show` call - `can_tools_lib.bash:380-448`). The moment any
   of these three differs from the conf, that interface flips to
   **observe-only** (`reason=config_mismatch_reboot_required`,
-  `can_watchdog.sh:882-887`) and **all** of TX flush, bus-off recovery and
-  stall/rebind are suspended for it (`can_watchdog.sh:944-953`) until the
+  `can_watchdog.sh:916-920`) and **all** of TX flush, bus-off recovery and
+  stall/rebind are suspended for it (`can_watchdog.sh:978-987`) until the
   mismatch clears - normally by rebooting (or, with the machine mechanically
   stopped, restarting `canhat_fd_setup.service`), either of which re-applies
   the interface with the new values so they match the conf again.
@@ -42,8 +60,8 @@ might suggest for the *interface setup* units. For the watchdog itself:
     default) when you change `CAN_RESTART_MS`, bus-off on that interface is
     recovered by **nobody** until the mismatch is resolved: the kernel will
     not auto-restart it (`restart-ms 0`), and the watchdog refuses to act on
-    a mismatched interface (`can_watchdog.sh:973-976`, gated by the
-    `observe_only` check at `can_watchdog.sh:953`).
+    a mismatched interface (`can_watchdog.sh:1007-1010`, gated by the
+    `observe_only` check at `can_watchdog.sh:987`).
 - **`CAN_BITRATE` / `CAN_DBITRATE` / `CAN_TXQUEUELEN`**: **not compared at
   all**. `can_iface_states` never extracts bitrate/dbitrate/txqueuelen from
   `ip -d link show` in the first place (`can_tools_lib.bash:406-442` only
@@ -52,11 +70,19 @@ might suggest for the *interface setup* units. For the watchdog itself:
   practical effect: editing `CAN_BITRATE` (or the other two) in the conf
   does **not** show up as a warning, and the **next time the watchdog calls
   `can_setup_iface` for any reason at all** - a TX flush
-  (`can_watchdog.sh:497`), a bus-off recovery (`can_watchdog.sh:420`), or the
-  final step of a stall rebind (`can_watchdog.sh:649`) - it is applied live,
+  (`can_watchdog.sh:522`), a bus-off recovery (`can_watchdog.sh:439`), or the
+  final step of a stall rebind (`can_watchdog.sh:674`) - it is applied live,
   down→up, to an interface that may still be carrying live traffic. This is
   exactly the class of incident this watchdog exists to prevent elsewhere;
   do not let a conf edit reintroduce it here.
+- **`CAN_IFACES` / `CAN_SPI_MAP`**: read once at boot by
+  `canhat_fd_rename.bash`/`enable_canhat_fd.sh`, and separately by
+  `can_watchdog.sh` every cycle (it iterates `CAN_IFACES` to decide which
+  interfaces to process, and `_wd_startup_bind_check` reads `CAN_SPI_MAP`
+  every cycle too). Changing either live mixes what the watchdog now thinks
+  it owns with what was actually renamed/bound at boot - there is no
+  mismatch check for this either, it is simply undefined which interface
+  gets touched next.
 
 **Operating rule: never edit `/opt/can_tools/can_tools.conf` while the
 machine is live. Never run `systemctl restart canhat_fd_setup.service` while
@@ -78,48 +104,48 @@ window is as short as possible.
 
 Target: only interfaces listed in `CAN_FLUSH_IFACES` (default `can0`;
 `_wd_flush_check` returns immediately for any other interface,
-`can_watchdog.sh:456`). Any other time the state is ERROR-WARNING/
+`can_watchdog.sh:481`). Any other time the state is ERROR-WARNING/
 ERROR-PASSIVE, the watchdog does not touch the interface at all - this is
 deliberate (down/up while in that state only discards traffic without fixing
 anything else).
 
 Condition: Δrx, Δtx, Δrx_fifo and Δtx_fifo are **all** zero for
-`WD_STALE_TX_FLUSH_S` (2) consecutive cycles (`can_watchdog.sh:458-468`).
+`WD_STALE_TX_FLUSH_S` (2) consecutive cycles (`can_watchdog.sh:483-491`).
 Right before acting, it re-reads all four counters twice, 100 ms apart, under
 `can_lock`, and aborts the flush if *any* of them moved in that window
-(`can_watchdog.sh:479-492`) - this re-check exists because a race here is
+(`can_watchdog.sh:501-514`) - this re-check exists because a race here is
 exactly the rx-offload lock's own trigger condition.
 
 Action: `can_setup_iface` (a full down→up with the current conf's bitrate/
 restart-ms/berr/fd/txqueuelen - the same thing a bus-off recovery or a
 startup bind does), logged `reason=tx_flush` (warning) on success or
-`reason=tx_flush_failed` (err) on failure (`can_watchdog.sh:514-517`).
+`reason=tx_flush_failed` (err) on failure (`can_watchdog.sh:539-541`).
 
 Backoff: the first flush for an interface has no extra wait; a second flush
 within the backoff window doubles 1→2→4→...→`WD_FLUSH_BACKOFF_MAX_S` (30)
-(`can_watchdog.sh:501-511`). 60 continuous seconds of ERROR-ACTIVE resets the
-backoff to 0 (`can_watchdog.sh:959-970`).
+(`can_watchdog.sh:526-536`). 60 continuous seconds of ERROR-ACTIVE resets the
+backoff to 0 (`can_watchdog.sh:993-1004`).
 
 ### Bus-off recovery
 
-Trigger: `state == BUS-OFF` (`can_watchdog.sh:973-976`).
+Trigger: `state == BUS-OFF` (`can_watchdog.sh:1007-1010`).
 
 1. **Settle**: sample `rx_packets` every `WD_SETTLE_SAMPLE_MS` (100 ms) until
    it is unchanged across 2 consecutive samples, up to `WD_SETTLE_MAX_MS`
-   (2000 ms) (`_wd_settle`, `can_watchdog.sh:337-355`). If it never settles,
+   (2000 ms) (`_wd_settle`, `can_watchdog.sh:356-374`). If it never settles,
    the cycle logs `reason=busoff_settle_timeout` (warning) and tries again
    next cycle - no recovery action is taken this time.
 2. **Backoff**: the first recovery attempt after settling has **no extra
    wait**. If a *previous* recovery on this interface completed within the
    last `WD_BUSOFF_QUIET_S` (10 s), the wait doubles: 1→2→4→...→
-   `WD_BUSOFF_BACKOFF_MAX_S` (30 s) (`can_watchdog.sh:395-413`). This is
+   `WD_BUSOFF_BACKOFF_MAX_S` (30 s) (`can_watchdog.sh:414-427`). This is
    logged `reason=busoff_recovery_backoff` (warning) while waiting.
 3. **Storm detection**: if `WD_STORM_COUNT` (5) or more bus-offs occurred in
    the last `WD_STORM_WINDOW_S` (60 s), one `reason=busoff_storm` CRIT is
    logged (edge-triggered, not repeated every cycle the storm persists) and
    the backoff is pinned to its max - but **recovery keeps running**; a
    storm does **not** mark the interface degraded by itself
-   (`can_watchdog.sh:379-393`).
+   (`can_watchdog.sh:394-412`).
 4. **Recovery**: `can_setup_iface` (down→up, same parameters as TX flush
    above). The ifindex does **not** change, so an application's open CAN
    socket stays valid across this (`can_watchdog.sh:420`). Success logs
@@ -132,9 +158,11 @@ Trigger: `state == BUS-OFF` (`can_watchdog.sh:973-976`).
    interface as actually stalled (rx-offload can already have been dead
    before the bus-off, in which case down/up alone never fixes it) - see
    "rx-offload stall" below. Separately, if 3 bus-off recoveries in a row
-   leave `rx_packets` completely unchanged *and* fifo errors have grown
-   since the first of those recoveries, that is also treated as a stall
-   (`can_watchdog.sh:910-942`).
+   each leave `rx_packets` unchanged from what it was right after *that*
+   recovery *and* fifo errors have grown since *that same* recovery (the
+   baseline is reset after every individual bus-off recovery, not just the
+   first one in the streak), that is also treated as a stall
+   (`can_watchdog.sh:936-977`).
 
 There is no `reason=busoff_recovery` in the logs - the actual reason strings
 are `busoff_recovery_backoff`, `busoff_settle_timeout`, `busoff_storm`,
@@ -245,7 +273,9 @@ watchdog checks every `CAN_SPI_MAP` entry's spidev for a driver binding
 - A bind failure here produces `reason=bind_failed_at_startup`; no netdev
   appearing produces `reason=bind_no_netdev`; a name collision produces
   `reason=pin_name_collision`; another pin failure produces
-  `reason=pin_name_failed` - all of these mark the interface degraded.
+  `reason=pin_name_failed`; a `can_setup_iface` failure on the freshly
+  bound/pinned interface produces `reason=setup_failed_at_startup` - all of
+  these mark the interface degraded.
 
 ### Netlink hangs (`rtnl_hung`) - global, not per-interface
 
@@ -319,9 +349,9 @@ exact sequence that caused it:
 For every other reason (`rebind_quota_exceeded`, `spidev_not_found`,
 `unbind_failed`, `bind_failed`, `bind_no_netdev`, `pin_name_collision`,
 `pin_name_failed`, `setup_failed`, `bind_failed_at_startup`,
-`rebind_verify_failed`), there is no leftover in-flight kernel-side state,
-so `--clear-degraded` followed by normal operation (or a repaired
-connection) is fine - the watchdog simply resumes evaluating that interface
+`rebind_verify_failed`, `setup_failed_at_startup`), there is no leftover
+in-flight kernel-side state, so `--clear-degraded` followed by normal
+operation (or a repaired connection) is fine - the watchdog simply resumes evaluating that interface
 from scratch next cycle.
 
 ## Complete reason-code table
@@ -357,12 +387,13 @@ table against a future version):
 | `rebind_verify_failed` | crit | **yes** | Positive stall evidence within the post-rebind verification window. |
 | `unbind_inflight_at_startup` | crit | **yes** | An unbind from before a watchdog restart is still (apparently) running. **Reboot.** |
 | `bind_failed_at_startup` | crit | **yes** | Startup reconciliation's own bind attempt failed. |
+| `setup_failed_at_startup` | crit | **yes** | Startup reconciliation's own `can_setup_iface` call failed after a successful bind/pin. |
 | `rtnl_hung` | warning (per cycle) / crit (via mark_degraded once the threshold hits) | **yes, all interfaces** | The `ip -d link show` call itself has timed out `WD_RTNL_HUNG_CONSEC` times in a row. **Reboot** - see the dedicated section above. |
 | `stall_detected_observe_only` | crit (rate-limited) | no | Stall signal true, but the interface is in observe-only mode (pause/admin-down/config-mismatch/berr-on), so no recovery was attempted. Resolve the observe-only cause (commonly: finish the pending reboot). |
 | `config_mismatch_reboot_required` | warning | no | `CAN_RESTART_MS`/`CAN_BERR_REPORTING`/`CAN_FD` in the conf differ from what the kernel is actually running. Reboot (or, machine-stopped, restart `canhat_fd_setup.service`) to apply. |
 | `iface_missing` | warning | no | The interface is configured (`CAN_IFACES`) but did not appear in this cycle's `ip -d link show` output at all - normal transiently during boot/rename, a concern if persistent. |
 | `pause_active` | warning (every `WD_PAUSE_WARN_S`, 600 s) | no | A pause is currently in effect; periodic reminder so an operator does not forget hardware is unsupervised. |
-| `pause_expired` | warning | no | A pause file exists but its deadline has passed (normal expiry, or a malformed file) - reminder that "a pause file exists" does not mean "paused". |
+| `pause_expired` | warning | no | A pause file exists, its deadline is numeric, and that deadline has passed (normal expiry) - reminder that "a pause file exists" does not mean "paused". A non-numeric/malformed deadline instead produces the lib's own "Invalid pause deadline in file" WARNING from `can_pause_active`, not this reason. |
 | `clear_degraded` | notice | n/a | Logged by `--clear-degraded` itself, confirming the action and which interface. |
 | `manual_reboot_required` | crit (every `WD_DEGRADED_CRIT_S`, 600 s) | n/a (already degraded) | Periodic re-announcement of an interface that is already degraded; `original_reason=` carries the reason that first caused it. |
 
@@ -388,8 +419,10 @@ is installed on `$PATH`. Source the lib and call them directly:
 # Pause for 30 minutes (can_pause's own default if you omit the argument):
 sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_read_conf; can_pause 30'
 
-# Check whether a pause is currently active, and its deadline (epoch seconds):
-cat /run/can_tools/watchdog.pause 2>/dev/null && echo "paused until the epoch time above" || echo "not paused"
+# Check whether a pause is currently active (this is what the watchdog itself
+# checks - a plain `cat` would also print an expired or malformed deadline
+# file as if it were active, which is not accurate):
+sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_pause_active && echo paused || echo "not paused"'
 
 # Resume immediately:
 sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_unpause'
@@ -490,9 +523,12 @@ echo spi0.0 | sudo tee /sys/bus/spi/drivers/mcp251xfd/bind
 
 # 5. Wait for the netdev to reappear, then pin its name and bring it up
 #    with the real conf (do not rely on the watchdog to do this while still
-#    paused):
+#    paused). can_pin_name does NOT take can_lock itself - only
+#    can_setup_iface does - so take it explicitly for the pair, and run
+#    can_setup_iface only if the pin actually succeeded (can_lock is
+#    reentrant, so can_setup_iface's own internal can_lock call nests fine):
 ls /sys/bus/spi/devices/spi0.0/net/   # wait until non-empty
-sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_read_conf; can_pin_name spi0.0 can0; can_setup_iface can0'
+sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_read_conf && can_lock 5 && { can_pin_name spi0.0 can0 && can_setup_iface can0; rc=$?; can_unlock; exit $rc; }'
 
 # 6. Resume the watchdog:
 sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_unpause'
@@ -501,14 +537,21 @@ sudo bash -c '. /opt/can_tools/can_tools_lib.bash; can_unpause'
 Notes:
 - Step 1's pause is what stops `_wd_startup_bind_check` from racing you and
   binding the spidev back the moment it notices the driver is gone
-  (`can_watchdog.sh:741`, `can_pause_active && continue`).
-- `can_pin_name`/`can_setup_iface` each take `can_lock` internally, so there
-  is no need to take the lock yourself around step 5.
+  (`can_watchdog.sh:766`, `can_pause_active && continue`).
+- Only `can_setup_iface` takes `can_lock` internally
+  (`can_tools_lib.bash:620-675`) - `can_pin_name` does **not**
+  (`can_tools_lib.bash:535-606` never calls `can_lock`). Step 5 above takes
+  the lock explicitly around both calls (the lock is reentrant, so
+  `can_setup_iface`'s own internal `can_lock` nests fine inside it) and,
+  because the two calls are joined with `&&` inside the `{ }` group, a
+  `can_pin_name` failure (e.g. rc=2 on a name collision, below) skips
+  `can_setup_iface` instead of running it anyway against a still-misnamed
+  interface.
 - If the two interfaces' SPI devices can probe in swapped order (rare, but
   the same situation `canhat_fd_rename.bash` handles at boot), `can_pin_name`
   returns rc=2 on a name collision; that is not handled automatically here -
   bind/pin one interface fully before touching the other, or re-run
   `canhat_fd_rename.bash` once both are back (it understands the swap case).
 - Do not skip step 6 - a forgotten pause silently keeps the watchdog from
-  recovering this interface (and, if you paused all interfaces together,
-  every interface) until it expires.
+  recovering **every** interface (pause is global, not per-interface - see
+  "Pause" above) until it expires.

@@ -16,6 +16,11 @@
 # statistics/ifindex files for the ifaces present in this tick and leaves
 # bind/unbind (and anything already written to them) untouched across calls,
 # so a test can verify a prior tick's "echo spiX.Y > unbind" write survives.
+#
+# 低-3: Ifaces that appear in a previous tick but not in the current tick are
+# removed from /sys/class/net and from the spidev's net directory, so tests can
+# verify unbind scenarios where netdev disappears. Rename operations via the
+# fake ip command also update sysfs accordingly.
 
 scenario_file="$1"
 tick="$2"
@@ -54,13 +59,34 @@ _link_spidev() {
     ln -sf "$sysfs_root/class/net/$if_name" "$sysfs_root/bus/spi/devices/$spidev/net/$if_name"
 }
 
+# Remove an interface from sysfs (低-3)
+_remove_iface() {
+    local if_name="$1"
+    local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:?}"
+
+    # Find and remove symlink from spidev's net directory
+    if [[ -L "$sysfs_root/class/net/$if_name/device" ]]; then
+        local old_target
+        old_target=$(readlink -f "$sysfs_root/class/net/$if_name/device")
+        local old_spidev="${old_target##*/}"
+        rm -f "$sysfs_root/bus/spi/devices/$old_spidev/net/$if_name" 2>/dev/null || true
+    fi
+
+    # Remove the entire interface directory
+    rm -rf "$sysfs_root/class/net/$if_name" 2>/dev/null || true
+}
+
 if [[ -f "$scenario_file" ]]; then
+    # Collect all ifaces present in current tick
+    declare -A present_ifaces=()
     while IFS= read -r line; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$line" ]] && continue
 
         read -r entry_tick if_name rx tx rxfifo txfifo ifindex <<<"$line"
         [[ "$entry_tick" == "$tick" ]] || continue
+
+        present_ifaces["$if_name"]=1
 
         mkdir -p "$sysfs_root/class/net/$if_name/statistics"
         echo "$rx" >"$sysfs_root/class/net/$if_name/statistics/rx_packets"
@@ -71,4 +97,14 @@ if [[ -f "$scenario_file" ]]; then
 
         _link_spidev "$if_name" "${spi_of_if[$if_name]:-}"
     done <"$scenario_file"
+
+    # Remove interfaces that are not in the current tick (低-3)
+    if [[ -d "$sysfs_root/class/net" ]]; then
+        for existing_dir in "$sysfs_root/class/net"/*; do
+            [[ -d "$existing_dir" ]] || continue
+            existing_if=$(basename "$existing_dir")
+            [[ -n "${present_ifaces[$existing_if]:-}" ]] && continue
+            _remove_iface "$existing_if"
+        done
+    fi
 fi

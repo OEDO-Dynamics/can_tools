@@ -7,19 +7,30 @@
 # This file is sourced, not executed. Does not call exit().
 #
 # Call convention (errexit safety, §2b addendum): every function in this file
-# is safe to source and call under a caller's `set -euo pipefail` WITHOUT
-# itself aborting mid-body on a normal, expected failure branch (e.g. an
-# interface that doesn't exist yet, a name collision, a bounded command that
-# times out). A function's own non-zero return value is still the CALLER's
-# responsibility to check -- this file does not change what each function
-# returns, only guarantees it reaches a `return` instead of dying partway
-# through on an internal statement. Because of that, call a function that can
-# return non-zero on its own (anything other than can_log/can_now) inside an
-# `if`/`||`/`&&` so your *own* `set -e` does the right thing with ITS result:
+# is safe to source and call under a caller's `set -euo pipefail` in the sense
+# that it will not die partway through its OWN body on an internal statement
+# (an uninitialized `local` under `set -u`, a plain `(( x++ ))`, a `cmd; rc=$?`
+# pair where `cmd` is allowed to fail, ...). That is the ONLY thing this file
+# guarantees. It does NOT mean the function is safe to call bare (unguarded,
+# not inside if/||/&&): under `set -e`, a bare call to any command -- library
+# function or not -- that returns non-zero aborts the CALLING script right
+# there, exactly as `set -e` is documented to do. That part of bash's
+# behavior is unchanged and cannot be "fixed" by this file.
+#
+# Only can_read_conf, can_unpause, can_log and can_now always return 0 and so
+# are the only functions actually safe to call bare. Every other function
+# (can_lock/can_unlock, can_run_bounded, can_iface_states, can_read_stats,
+# can_spidev_of, can_iface_of_spidev, can_pin_name, can_setup_iface,
+# can_pause, can_pause_active, ...) returns non-zero on a normal, expected
+# branch (lock contention, no iface yet, a bounded command timing out, "not
+# currently paused", ...) and MUST be called inside `if`/`||`/`&&` so your
+# `set -e` does the right thing with THAT result, e.g.:
 #     if can_lock 5; then ...; fi
 #     can_setup_iface can0 || handle_failure
-# A bare, unguarded call is fine too (bash does not abort on the call itself),
-# but then you must inspect "$?" yourself if you care about the outcome.
+#     can_pause_active && echo "paused"
+# A bare `can_pause_active` in a watchdog loop, for instance, would abort
+# (and under `Restart=always`, crash-loop) the service on every tick it is
+# NOT paused, which is the common case.
 
 # Default values for all configuration keys (§2a)
 declare -g CAN_IFACES="can0 can1"
@@ -440,8 +451,9 @@ can_iface_states() {
 # can_read_stats <if>
 # Called once per iface per watchdog tick (WD_LOOP_S), so this avoids forking
 # `cat` per file -- `read` is a builtin; a plain `<` redirect on it forks
-# nothing. Always returns 0 once past the iface-exists check; safe to call
-# bare under the caller's `set -e`.
+# nothing. Returns 0 once the iface dir exists, 1 if it doesn't (a normal,
+# transient state mid unbind/bind) -- call it inside if/|| under the caller's
+# `set -e`, per the file header; it does NOT always return 0.
 can_read_stats() {
     local if="$1"
     local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-/sys}"
@@ -451,10 +463,14 @@ can_read_stats() {
 
     local rx_packets=0 tx_packets=0 rx_fifo=0 tx_fifo=0 ifindex=0
 
-    # `read`'s own failure (e.g. a file vanishing mid-read) just leaves the
-    # "=0" default above in place, same as the previous `cat`-on-missing-file
-    # behavior; `2>/dev/null` before `<` so that failure's stderr (if any)
-    # doesn't leak, matching _can_is_alive's reasoning.
+    # `read` on a missing file is skipped by the `-f` check and the "=0"
+    # default above is kept. `read` on a file that EXISTS but is empty (EOF
+    # with nothing read) instead sets the variable to an empty string, same
+    # as the previous `cat`-on-empty-file behavior -- NOT a regression, but
+    # also not "=0", so an empty sysfs file would print "" rather than "0" in
+    # the output line below (as it always has). `2>/dev/null` before `<` so
+    # that a read failure's stderr (if any) doesn't leak, matching
+    # _can_is_alive's reasoning.
     [[ -f "$base/statistics/rx_packets" ]] && { read -r rx_packets 2>/dev/null <"$base/statistics/rx_packets" || true; }
     [[ -f "$base/statistics/tx_packets" ]] && { read -r tx_packets 2>/dev/null <"$base/statistics/tx_packets" || true; }
     [[ -f "$base/statistics/rx_fifo_errors" ]] && { read -r rx_fifo 2>/dev/null <"$base/statistics/rx_fifo_errors" || true; }
@@ -467,7 +483,9 @@ can_read_stats() {
 
 # SPI Device Mapping (§2b)
 # can_spidev_of <if>
-# Returns 0 (printed the spidev) / 1 (no device symlink). Safe to call bare.
+# Returns 0 (printed the spidev) / 1 (no device symlink -- the normal case
+# before an iface is renamed/bound). Call it inside if/|| under the caller's
+# `set -e` -- see the file header; it does NOT always return 0.
 can_spidev_of() {
     local if="$1"
     local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-/sys}"
@@ -485,8 +503,9 @@ can_spidev_of() {
 }
 
 # can_iface_of_spidev <spidev>
-# Returns 0 (printed the iface name) / 1 (no net/ dir, or it's empty). Safe
-# to call bare.
+# Returns 0 (printed the iface name) / 1 (no net/ dir, or it's empty -- a
+# normal transient state mid unbind/bind). Call it inside if/|| under the
+# caller's `set -e` -- see the file header; it does NOT always return 0.
 can_iface_of_spidev() {
     local spidev="$1"
     local sysfs_root="${CAN_TOOLS_SYSFS_ROOT:-/sys}"
@@ -657,7 +676,8 @@ can_setup_iface() {
 
 # Pause/Resume (§2b)
 # can_pause [min]
-# Returns 0 on success, 1 on an invalid duration. Safe to call bare.
+# Returns 0 on success, 1 on an invalid duration. Call it inside if/|| under
+# the caller's `set -e` -- see the file header; it does NOT always return 0.
 can_pause() {
     local min="${1:-${WD_PAUSE_DEFAULT_MIN:-30}}"
 
@@ -689,7 +709,10 @@ can_unpause() {
 
 # can_pause_active
 # Returns 0 if a pause is in effect, 1 otherwise (including "no pause file" /
-# "corrupt pause file"). Safe to call bare.
+# "corrupt pause file" -- the NORMAL, common case when nothing is paused).
+# Call it inside if/|| under the caller's `set -e` -- see the file header.
+# A bare, unguarded `can_pause_active` in a watchdog loop would abort the
+# whole loop on every tick that is not paused.
 can_pause_active() {
     local run_dir="${CAN_TOOLS_RUN_DIR:-/run/can_tools}"
     local pause_file="$run_dir/watchdog.pause"
@@ -770,13 +793,18 @@ can_now() {
         read -r fake_now 2>/dev/null <"$CAN_TOOLS_FAKE_TIME_FILE" || true
         echo "$fake_now"
     else
-        # Use EPOCHREALTIME if available, otherwise date +%s
+        # Use EPOCHREALTIME if available, otherwise date +%s. EPOCHREALTIME
+        # is "<seconds>.<microseconds>" in bash's own fixed internal format,
+        # not locale-formatted -- but strip on either `.` or `,` (L-3)
+        # rather than assume `.`, in case that ever changes or this is
+        # copy-pasted somewhere with LC_NUMERIC in play.
         if [[ -n "${EPOCHREALTIME+x}" ]]; then
-            echo "${EPOCHREALTIME%.*}"
+            echo "${EPOCHREALTIME%%[.,]*}"
         else
             date +%s
         fi
     fi
+    return 0
 }
 
 return 0

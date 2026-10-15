@@ -17,6 +17,33 @@
 # test script's own, more lenient, shell options), and checks that the
 # subprocess exits 0 and prints the trailing ERREXIT_OK marker -- proving it
 # ran to completion rather than dying partway through.
+#
+# IMPORTANT (per the PR #17 review): a function call must be made BARE (no
+# surrounding if/||/&&, and NOT inside $( )) for a scenario to actually prove
+# anything about errexit safety. Two reasons:
+#   1. Per bash's documented -e semantics, "if a compound command or shell
+#      function executes in a context where -e is being ignored, none of the
+#      commands executed within [it] will be affected by the -e setting" --
+#      so wrapping a call in `fn ... || rc=$?` or `if fn ...; then` disables
+#      errexit enforcement for EVERYTHING inside that call, not just for the
+#      call's own final result. Those guarded forms below only prove the
+#      *return value*/`set -u` behavior is right, not that no internal
+#      statement would have aborted under a bare call.
+#   2. `$( )` spawns a subshell, and empirically (verified directly: `set -e;
+#      out=$(echo before; false; echo after); echo "$out"` prints BOTH
+#      "before" and "after" -- `false` mid-sequence inside a command
+#      substitution does not abort it) a non-last statement's failure inside
+#      a command substitution does not necessarily abort that subshell either.
+#      can_iface_states must never be called via $( ) anyway (see its own
+#      header comment), so this was a double violation.
+# So: whenever a scenario below is meant to prove a NORMAL, SUCCESSFUL
+# (overall rc=0) path doesn't abort internally, the call is bare, with its
+# real exit status left to be `set -e`'s own (the subprocess's exit code,
+# checked by run_errexit). Scenarios that call a function expecting a
+# normal-but-non-zero return (collision, "not paused", missing iface, ...)
+# are guarded with if/|| as the file's own call convention requires -- those
+# are testing return-value/`set -u` correctness, not errexit-abort-freedom,
+# since guarding necessarily suspends the errexit check for that call.
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 lib="$repo_root/can_tools_lib.bash"
@@ -93,6 +120,19 @@ if can_unlock; then echo "should not succeed"; exit 1; fi
 echo ERREXIT_OK
 '
 
+# ========== can_run_bounded: a slow (but successful) child ==========
+echo "Testing can_run_bounded under set -euo pipefail..."
+
+# A child that takes several 0.1s ticks to finish -- the overall result is
+# rc=0 (the child's own exit code), so this is called BARE. This is the
+# scenario that exercises the `i=$((i+1))` loop counter at least 2-3 times
+# while waiting; reverting it to `(( i++ ))` aborts on the very first tick.
+run_errexit "can_run_bounded with a slow child (bare, hits the loop counter)" \
+    "CAN_TOOLS_RUN_DIR=$tmpdir/run_bounded_slow" -- '
+can_run_bounded 3 sleep 0.3
+echo ERREXIT_OK
+'
+
 # ========== can_now: fake clock present / absent, under env -i ==========
 echo "Testing can_now under set -euo pipefail, with and without a fake clock..."
 
@@ -135,6 +175,23 @@ mkdir -p "$sysfs0/bus/spi/devices/spi0.0/net/can0"
 run_errexit "can_pin_name rc=0 (name already matches, bare)" \
     "CAN_TOOLS_SYSFS_ROOT=$sysfs0" "CAN_TOOLS_IP_CMD=$repo_root/tests/fakes/ip" -- '
 can_pin_name spi0.0 can0
+echo ERREXIT_OK
+'
+
+# branch: want is a FREE name -> rename proceeds -> rc=0 overall, called
+# BARE. This is the branch that actually exercises check_rc ("ip link show
+# can7" fails because can7 does not exist -- the normal/expected outcome,
+# via the `|| check_rc=$?` guard) and rename_rc (the down+rename calls
+# themselves), unlike the "name already matches" test above which returns
+# before either of those lines run. Reverting either guard reproduces an
+# abort here.
+sysfs_free="$tmpdir/sysfs_pin_free"
+fakedir_free="$tmpdir/fakeip_pin_free"
+mkdir -p "$sysfs_free/bus/spi/devices/spi0.0/net/can0" "$fakedir_free/can0"
+echo "restart_ms=0 berr=off fd=off admin=down" >"$fakedir_free/can0/config"
+run_errexit "can_pin_name rename to a free name (bare, hits check_rc + rename_rc)" \
+    "CAN_TOOLS_SYSFS_ROOT=$sysfs_free" "CAN_TOOLS_IP_CMD=$repo_root/tests/fakes/ip" "CAN_TOOLS_FAKE_DIR=$fakedir_free" -- '
+can_pin_name spi0.0 can7
 echo ERREXIT_OK
 '
 
@@ -185,10 +242,17 @@ fakedir_states="$tmpdir/fakeip_states"
 mkdir -p "$fakedir_states/can0"
 echo "ERROR-ACTIVE" >"$fakedir_states/can0/state"
 echo "restart_ms=100 berr=off fd=on admin=up" >"$fakedir_states/can0/config"
-run_errexit "can_iface_states with one iface present, bare call (found++ from 0)" \
-    "CAN_TOOLS_IP_CMD=$repo_root/tests/fakes/ip" "CAN_TOOLS_FAKE_DIR=$fakedir_states" "CAN_TOOLS_RUN_DIR=$tmpdir/run_states" -- '
-out=$(can_iface_states)
-[[ "$out" == *"can0"* ]] || { echo "out=$out"; exit 1; }
+states_out="$tmpdir/states_out.txt"
+# Bare call, output to a real file via plain redirection -- NOT $( ), both
+# because that is the lib's own documented calling convention for
+# can_iface_states (see its header: can_run_bounded's CAN_RUN_BOUNDED_PID
+# tracking needs the current shell, not a subshell) and because $( ) would
+# not actually exercise errexit here (see the file header above). Overall
+# rc=0 (>=1 iface found) is the expected result, so the call is bare.
+run_errexit "can_iface_states with one iface present, bare call to a file (found++ from 0)" \
+    "CAN_TOOLS_IP_CMD=$repo_root/tests/fakes/ip" "CAN_TOOLS_FAKE_DIR=$fakedir_states" "CAN_TOOLS_RUN_DIR=$tmpdir/run_states" "STATES_OUT=$states_out" -- '
+can_iface_states >"$STATES_OUT"
+grep -q can0 "$STATES_OUT" || { echo "missing can0 in $STATES_OUT: $(cat "$STATES_OUT")"; exit 1; }
 echo ERREXIT_OK
 '
 
@@ -207,6 +271,32 @@ echo "Testing can_setup_iface (DRY_RUN) under set -euo pipefail..."
 
 run_errexit "can_setup_iface with CAN_TOOLS_DRY_RUN=1, bare call" \
     "CAN_TOOLS_IP_CMD=$repo_root/tests/fakes/ip" "CAN_TOOLS_RUN_DIR=$tmpdir/run_dryrun" "CAN_TOOLS_DRY_RUN=1" -- '
+can_setup_iface can0
+[[ "$_CAN_LOCK_DEPTH" == "0" ]] || { echo "depth=$_CAN_LOCK_DEPTH"; exit 1; }
+echo ERREXIT_OK
+'
+
+# can_setup_iface's REAL (non-DRY_RUN) path, where the best-effort `down`
+# call fails but `up`/`txqueuelen` succeed -- the scenario the `|| true` on
+# the down line exists for. A tiny wrapper around tests/fakes/ip fails only
+# "link set <if> down", delegating everything else to the real fake so `up`
+# and `txqueuelen` still go through and update the fake config normally.
+# Overall result is rc=0 (can_setup_iface doesn't check down's result), so
+# the call is bare; reverting the down line's `|| true` aborts here.
+down_fail_ip="$tmpdir/ip_fail_down"
+cat >"$down_fail_ip" <<EOF
+#!/bin/bash
+if [[ "\$1 \$2" == "link set" && "\$4" == "down" ]]; then
+    exit 1
+fi
+exec "$repo_root/tests/fakes/ip" "\$@"
+EOF
+chmod +x "$down_fail_ip"
+fakedir_down_fail="$tmpdir/fakeip_down_fail"
+mkdir -p "$fakedir_down_fail/can0"
+echo "restart_ms=100 berr=off fd=off admin=down" >"$fakedir_down_fail/can0/config"
+run_errexit "can_setup_iface where down fails but up succeeds (bare, real non-DRY_RUN path)" \
+    "CAN_TOOLS_IP_CMD=$down_fail_ip" "CAN_TOOLS_RUN_DIR=$tmpdir/run_downfail" "CAN_TOOLS_FAKE_DIR=$fakedir_down_fail" -- '
 can_setup_iface can0
 [[ "$_CAN_LOCK_DEPTH" == "0" ]] || { echo "depth=$_CAN_LOCK_DEPTH"; exit 1; }
 echo ERREXIT_OK

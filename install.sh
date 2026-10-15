@@ -337,6 +337,8 @@ main() {
         "vcan_down.bash:0755"
         "record_can.bash:0755"
         "play_can.bash:0755"
+        "can_watchdog.sh:0755"
+        "can_diag.sh:0755"
     )
 
     for file_entry in "${files_to_install[@]}"; do

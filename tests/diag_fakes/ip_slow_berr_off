@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# tests/diag_fakes/ip_slow_berr_off - wraps tests/fakes/ip (PR-A1's fake,
+# unmodified) and adds a delay to the "up ... berr-reporting off" call, i.e.
+# the RESTORE step, to test can_diag.sh being signalled a SECOND time while
+# cleanup is itself still in progress (Issue #9 review H3).
+# CAN_TOOLS_DIAG_IP_SLEEP controls the delay (default 2s).
+
+real_ip="$(cd "$(dirname "$0")/../fakes" && pwd)/ip"
+
+if [[ "$*" == *"berr-reporting off"* ]]; then
+    sleep "${CAN_TOOLS_DIAG_IP_SLEEP:-2}"
+fi
+
+exec "$real_ip" "$@"

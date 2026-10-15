@@ -345,12 +345,215 @@ run_ip_hang() {
     rm -rf "$tmpdir"
 }
 
+# ---------------------------------------------------------------------------
+# Test 7: SIGTERM while a can_setup_iface(berr on) call is still in flight
+# must still end up with the interface fully restored (Issue #9 2nd review,
+# H2): the iface must be registered for restore BEFORE the call that can
+# block, and cleanup must wait (bounded) for that call's outstanding bounded
+# child before trying to restore - otherwise it is abandoned half-up/down,
+# with berr-reporting whatever can_setup_iface's down/up cycle happened to
+# leave it as, and no pause protecting it.
+# ---------------------------------------------------------------------------
+run_sigterm_during_berr_setup() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$diag_fakes_path/ip_slow_berr_on"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_DIAG_IP_SLEEP=3
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0" "$tmpdir/fake/can1"
+    for i in can0 can1; do
+        echo "ERROR-ACTIVE" >"$tmpdir/fake/$i/state"
+        echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/$i/config"
+        mkdir -p "$tmpdir/sys/class/net/$i/statistics"
+        for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+            echo "0" >"$tmpdir/sys/class/net/$i/statistics/$f"
+        done
+    done
+
+    echo "Testing can_diag.sh restores the interface even when SIGTERM'd mid berr-on setup (H2)..."
+
+    ( cd "$repo_dir" && exec bash can_diag.sh 30 >"$tmpdir/out.log" 2>&1 ) &
+    local diag_pid=$!
+    sleep 1
+
+    kill -TERM "$diag_pid" 2>/dev/null
+    wait "$diag_pid" 2>/dev/null
+    local rc=$?
+    local _rc_nonzero=0
+    [[ $rc -ne 0 ]] || _rc_nonzero=1
+    check "$_rc_nonzero" "can_diag.sh killed mid berr-on setup should exit non-zero (got rc=$rc)"
+
+    for i in can0 can1; do
+        local cfg
+        cfg=$(cat "$tmpdir/fake/$i/config")
+        [[ "$cfg" == "restart_ms=0 berr=off fd=on admin=up" ]]
+        check $? "$i must be fully restored (admin=up, berr=off, restart_ms=0, fd=on) after SIGTERM mid berr-on setup (H2) (got: $cfg)"
+    done
+
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "watchdog.pause should be cleaned up after SIGTERM mid berr-on setup"
+
+    exec 8>"$tmpdir/run/lock"
+    flock -n 8
+    check $? "lock should be released after SIGTERM mid berr-on setup"
+    exec 8>&-
+
+    pkill -KILL -f "$diag_fakes_path/ip_slow_berr_on" 2>/dev/null || true
+    unset CAN_TOOLS_DIAG_IP_SLEEP
+    rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
+# Test 8: a SECOND signal arriving while cleanup/restore is itself still in
+# progress must not abort cleanup partway through (Issue #9 2nd review, H3) -
+# e.g. an operator pressing Ctrl-C twice, or systemd stop -> kill.
+# ---------------------------------------------------------------------------
+run_double_sigterm() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$diag_fakes_path/ip_slow_berr_off"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_CANDUMP_CMD="$diag_fakes_path/candump"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+    export CAN_TOOLS_DIAG_IP_SLEEP=2
+    export CAN_TOOLS_DIAG_CANDUMP_HANG=1
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0" "$tmpdir/fake/can1"
+    for i in can0 can1; do
+        echo "ERROR-ACTIVE" >"$tmpdir/fake/$i/state"
+        echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/$i/config"
+        mkdir -p "$tmpdir/sys/class/net/$i/statistics"
+        for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+            echo "0" >"$tmpdir/sys/class/net/$i/statistics/$f"
+        done
+    done
+
+    echo "Testing can_diag.sh ignores a second TERM while cleanup/restore is in progress (H3)..."
+
+    ( cd "$repo_dir" && exec bash can_diag.sh 30 >"$tmpdir/out.log" 2>&1 ) &
+    local diag_pid=$!
+    sleep 1.5
+    kill -TERM "$diag_pid" 2>/dev/null
+    sleep 1
+    # at this point cleanup is in the H1 restore loop, blocked in the slow
+    # "berr-reporting off" ip call - a second TERM here must be ignored.
+    kill -TERM "$diag_pid" 2>/dev/null
+    wait "$diag_pid" 2>/dev/null
+    local rc=$?
+    local _rc_nonzero=0
+    [[ $rc -ne 0 ]] || _rc_nonzero=1
+    check "$_rc_nonzero" "can_diag.sh double-SIGTERM'd should still exit non-zero (got rc=$rc)"
+
+    for i in can0 can1; do
+        local cfg
+        cfg=$(cat "$tmpdir/fake/$i/config")
+        [[ "$cfg" == "restart_ms=0 berr=off fd=on admin=up" ]]
+        check $? "$i must still be fully restored despite the second TERM during cleanup (H3) (got: $cfg)"
+    done
+
+    [[ ! -f "$tmpdir/run/watchdog.pause" ]]
+    check $? "watchdog.pause should be cleaned up despite the second TERM during cleanup (H3)"
+
+    exec 8>"$tmpdir/run/lock"
+    flock -n 8
+    check $? "lock should be released despite the second TERM during cleanup (H3)"
+    exec 8>&-
+
+    pkill -KILL -f "$diag_fakes_path/candump" 2>/dev/null || true
+    unset CAN_TOOLS_DIAG_IP_SLEEP CAN_TOOLS_DIAG_CANDUMP_HANG
+    rm -rf "$tmpdir"
+}
+
+# ---------------------------------------------------------------------------
+# Test 9: two concurrent runs - the second must never sample/capture with
+# berr-reporting on while unpaused (Issue #9 2nd review, M2): the probe-to-
+# lock gap is not protected by can_lock, so re-assert the pause once the
+# lock is actually held, before touching any interface.
+# ---------------------------------------------------------------------------
+run_concurrent_pause() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    export CAN_TOOLS_RUN_DIR="$tmpdir/run"
+    export CAN_TOOLS_FAKE_DIR="$tmpdir/fake"
+    export CAN_TOOLS_IP_CMD="$fakes_path/ip"
+    export CAN_TOOLS_JOURNALCTL_CMD="$fakes_path/journalctl"
+    export CAN_TOOLS_SYSFS_ROOT="$tmpdir/sys"
+
+    mkdir -p "$tmpdir/run" "$tmpdir/fake/can0"
+    echo "ERROR-ACTIVE" >"$tmpdir/fake/can0/state"
+    echo "restart_ms=0 berr=off fd=on admin=up" >"$tmpdir/fake/can0/config"
+    mkdir -p "$tmpdir/sys/class/net/can0/statistics"
+    for f in rx_packets tx_packets rx_fifo_errors tx_fifo_errors; do
+        echo "0" >"$tmpdir/sys/class/net/can0/statistics/$f"
+    done
+
+    cat >"$tmpdir/candump_A" <<'EOF'
+#!/bin/bash
+sleep 2
+exit 0
+EOF
+    chmod +x "$tmpdir/candump_A"
+    cat >"$tmpdir/candump_B" <<'EOF'
+#!/bin/bash
+sleep 1
+exit 0
+EOF
+    chmod +x "$tmpdir/candump_B"
+
+    echo "Testing can_diag.sh never samples with berr on while unpaused, under concurrency (M2)..."
+
+    ( cd "$repo_dir" && CAN_TOOLS_CANDUMP_CMD="$tmpdir/candump_A" exec bash can_diag.sh 10 >"$tmpdir/out.A" 2>&1 ) &
+    local pidA=$!
+    sleep 0.3
+    ( cd "$repo_dir" && CAN_TOOLS_CANDUMP_CMD="$tmpdir/candump_B" exec bash can_diag.sh 10 >"$tmpdir/out.B" 2>&1 ) &
+    local pidB=$!
+
+    local violation=0
+    local i
+    for i in $(seq 1 40); do
+        local pause berr
+        pause=$(cat "$tmpdir/run/watchdog.pause" 2>/dev/null || echo "")
+        berr=$(grep -o 'berr=[a-z]*' "$tmpdir/fake/can0/config" 2>/dev/null)
+        if [[ -z "$pause" && "$berr" == "berr=on" ]]; then
+            violation=1
+            echo "  VIOLATION at poll $i: pause file missing while berr=on"
+        fi
+        kill -0 "$pidA" 2>/dev/null || kill -0 "$pidB" 2>/dev/null || break
+        sleep 0.15
+    done
+
+    check "$violation" "berr-reporting must never be on while the pause file is absent, even with two concurrent runs (M2 - N7)"
+
+    wait "$pidA" 2>/dev/null; local rcA=$?
+    wait "$pidB" 2>/dev/null; local rcB=$?
+    local _ab_ok=0
+    [[ $rcA -eq 0 && $rcB -eq 0 ]] || _ab_ok=1
+    check "$_ab_ok" "both concurrent runs should exit cleanly, not crash or leave the other hanging (rcA=$rcA rcB=$rcB)"
+
+    local final_berr
+    final_berr=$(grep -o 'berr=[a-z]*' "$tmpdir/fake/can0/config")
+    [[ "$final_berr" == "berr=off" ]]
+    check $? "berr-reporting should be off once both concurrent runs have finished (got: $final_berr)"
+
+    rm -rf "$tmpdir"
+}
+
 run_normal
 run_invalid_args
 run_sigterm
 run_sigint
 run_lock_contention
 run_ip_hang
+run_sigterm_during_berr_setup
+run_double_sigterm
+run_concurrent_pause
 
 echo ""
 echo "Results: $pass passed, $fail failed"

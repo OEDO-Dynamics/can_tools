@@ -31,19 +31,16 @@ jobs:
 
           # Add repo-root *.sh and *.bash (excluding excluded patterns)
           while IFS= read -r f; do
-              # Skip excluded files/dirs
-              if [[ "$f" == "can-utils/"* ]] || [[ "$f" == "openimu/"* ]]; then
-                  continue
-              fi
-              # Skip files to be modified in later PRs
-              if [[ "$f" == "canhat_fd_setup.bash" ]] || \
-                 [[ "$f" == "canhat_fd_rename.bash" ]] || \
-                 [[ "$f" == "enable_canhat_fd.sh" ]] || \
-                 [[ "$f" == "can_monitor.sh" ]]; then
+              basename="$(basename "$f")"
+              # Skip files to be modified in later PRs (PR-A2, PR-B)
+              if [[ "$basename" == "canhat_fd_setup.bash" ]] || \
+                 [[ "$basename" == "canhat_fd_rename.bash" ]] || \
+                 [[ "$basename" == "enable_canhat_fd.sh" ]] || \
+                 [[ "$basename" == "can_monitor.sh" ]]; then
                   continue
               fi
               files+=("$f")
-          done < <(find . -maxdepth 1 -type f \( -name "*.sh" -o -name "*.bash" \) | sort)
+          done < <(find . -maxdepth 1 -type f \( -name "*.sh" -o -name "*.bash" \) ! -path "./can-utils/*" ! -path "./openimu/*" | sort)
 
           # Add tests/ files (excluding fakes/ directory for now, only test_*.sh)
           while IFS= read -r f; do

@@ -1,0 +1,59 @@
+#!/bin/bash
+
+# Fake candump for testing can_diag.sh (PR-C's own fake; distinct from the
+# PR-A1 tests/fakes/ contract, which this file does not touch).
+#
+# Emits `candump -L` lines: "(<ts>) <iface> <id_hex>#<data_hex>". can_diag.sh
+# is fixed to -L (see Issue #9 review C2), so this is the only format this
+# fake needs to produce.
+#
+# Env:
+#   CAN_TOOLS_FAKE_DIR            base dir for scenario files (default: .)
+#   CAN_TOOLS_CANDUMP_SCENARIO    name of a file under
+#                                 "$CAN_TOOLS_FAKE_DIR/candump/" to cat
+#                                 verbatim instead of the built-in default
+#   CAN_TOOLS_DIAG_CANDUMP_HANG   if set, ignore SIGTERM and never exit
+#                                 (simulates an unresponsive candump, for
+#                                 forced-kill / SIGKILL tests)
+
+fake_dir="${CAN_TOOLS_FAKE_DIR:-.}"
+
+if [[ -n "${CAN_TOOLS_DIAG_CANDUMP_HANG:-}" ]]; then
+    trap '' TERM
+    while true; do sleep 1; done
+fi
+
+if [[ -n "${CAN_TOOLS_CANDUMP_SCENARIO:-}" ]]; then
+    if [[ -f "$fake_dir/candump/$CAN_TOOLS_CANDUMP_SCENARIO" ]]; then
+        cat "$fake_dir/candump/$CAN_TOOLS_CANDUMP_SCENARIO"
+        exit 0
+    fi
+fi
+
+# Default scenario: a realistic mix of ordinary traffic plus error frames
+# that exercise every category can_diag.sh's diag_classify_line() decodes.
+# can_id has CAN_ERR_FLAG (0x20000000) set for every error frame; the class
+# bits live in the low bits of can_id, data[1]/[2]/[3]/[4] per
+# linux/can/error.h. Expected counts (checked by tests/test_diag_classify.sh):
+#   can0 class=ACK       count=1   (line 2:  20000020)
+#   can0 class=BUSOFF    count=1   (line 3:  20000040)
+#   can0 class=PROT      count=2   (lines 4, 5)
+#   can0 class=BUSERROR  count=1   (line 4:  20000088)
+#   can0 prot=TX         count=1   (line 4:  data[2]=0x80)
+#   can0 loc=ACK         count=1   (line 4:  data[3]=0x19)
+#   can0 prot=FORM       count=1   (line 5:  data[2]=0x02)
+#   can0 class=CRTL      count=1   (line 6:  20000004)
+#   can0 ctrl=RX_WARNING count=1   (line 6:  data[1]=0x04)
+#   can1 class=TRX       count=1   (line 7:  20000010)
+#   can1 trx=CANH_SHORT_TO_GND count=1 (line 7: data[4]=0x07)
+cat <<'EOF'
+(1697000000.000001) can0 18DA31F9#0011223344556677
+(1697000000.000002) can0 20000020#0000000000000000
+(1697000000.000003) can0 20000040#0000000000000000
+(1697000000.000004) can0 20000088#0000801900080000
+(1697000000.000005) can0 20000008#0000020000000000
+(1697000000.000006) can0 20000004#0004000000000000
+(1697000000.000007) can1 20000010#0000000007000000
+EOF
+
+exit 0

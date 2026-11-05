@@ -1,0 +1,108 @@
+name: Weekly staging PR
+
+on:
+  schedule:
+    # Friday 08:00 Asia/Tokyo (JST) = Thursday 23:00 UTC.
+    - cron: '0 23 * * 4'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Inspect only; do not create a PR'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: weekly-develop-to-staging
+  cancel-in-progress: false
+
+jobs:
+  staging-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create or reuse develop to staging PR
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          STAGING_PR_DRAFT: 'false'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Executed by actions/github-script. Keep this logic identical in every repository.
+            const {owner, repo} = context.repo;
+            const head = 'develop';
+            const base = 'staging';
+            const dryRun = context.eventName === 'workflow_dispatch' &&
+              String(context.payload.inputs?.dry_run ?? 'true') === 'true';
+            const draft = process.env.STAGING_PR_DRAFT === 'true';
+            const report = async message => {
+              core.info(message);
+              await core.summary.addRaw(message).write();
+            };
+            if (!dryRun && context.ref !== `refs/heads/${context.payload.repository.default_branch}`) {
+              throw new Error('PR creation must run from the default branch. Use dry_run for other refs.');
+            }
+            // Fail explicitly if either branch is missing; never reset or implicitly seed staging.
+            for (const branch of [head, base]) {
+              try {
+                await github.rest.repos.getBranch({owner, repo, branch});
+              } catch (error) {
+                if (error.status === 404) {
+                  throw new Error(`Required branch ${branch} is missing. Initialize it before enabling the schedule.`);
+                }
+                throw error;
+              }
+            }
+            const findExisting = () => github.rest.pulls.list({
+              owner, repo, state: 'open', head: `${owner}:${head}`, base, per_page: 1
+            });
+            let existing = (await findExisting()).data;
+            if (existing.length) {
+              await report(`Existing PR retained: ${existing[0].html_url}`);
+              return;
+            }
+            const {data: comparison} = await github.rest.repos.compareCommitsWithBasehead({
+              owner, repo, basehead: `${base}...${head}`, per_page: 1
+            });
+            // A behind-only branch must not open a reverse promotion PR.
+            if (comparison.ahead_by === 0 || comparison.files?.length === 0) {
+              await report('No changes to promote from develop to staging.');
+              return;
+            }
+            if (dryRun) {
+              await report(`Dry run: would create ${head} → ${base} (${comparison.ahead_by} commits ahead).`);
+              return;
+            }
+            const jstDate = new Intl.DateTimeFormat('en-CA', {timeZone: 'Asia/Tokyo'}).format(new Date());
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            try {
+              const {data: pr} = await github.rest.pulls.create({
+                owner, repo, head, base, draft,
+                title: `chore: promote develop to staging (${jstDate} JST)`,
+                body: [
+                  '## Staging promotion',
+                  '',
+                  'Scheduled for Fridays at 08:00 JST (Thursday 23:00 UTC).',
+                  'This PR tracks the live develop branch; later develop commits are included until it is merged.',
+                  'Review the diff and checks before merging. This workflow does not merge or deploy.',
+                  'Use a merge commit to preserve shared ancestry between develop and staging.',
+                  '',
+                  `Workflow run: ${runUrl}`
+                ].join('\n')
+              });
+              await report(`Created PR: ${pr.html_url}`);
+            } catch (error) {
+              // A human or another automation may have created the same PR after our check.
+              if (error.status === 422) {
+                existing = (await findExisting()).data;
+                if (existing.length) {
+                  await report(`Existing PR retained: ${existing[0].html_url}`);
+                  return;
+                }
+              }
+              throw error;
+            }

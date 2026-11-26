@@ -1,6 +1,7 @@
 [Unit]
 Description=CAN Hat Plus Setup Service
-After=network.target
+After=network.target canhat_plus_rename.service
+Wants=canhat_plus_rename.service
 
 [Service]
 Type=oneshot

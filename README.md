@@ -90,6 +90,9 @@ For full option details, see `/opt/can_tools/can_tools.conf.example`.
 
 ### Systemd Services
 
+Each FD/Plus setup unit pulls in its matching rename unit and waits for it;
+with both unit files installed, rename does not need to be enabled separately.
+
 **CAN HAT FD** (supports CAN FD at 2 Mbps data rate): `install.sh` already
 installs and enables these units; they are started by systemd itself at boot
 (`WantedBy=multi-user.target`). Use `systemctl status`/`journalctl -u` to

@@ -34,6 +34,10 @@ for kind in fd plus; do
         has_dependency "$repo_root/$setup" "$directive" "$rename"
         check $? "$setup must have $directive=$rename"
     done
+    has_dependency "$repo_root/$rename" Before docker.service
+    check $? "$rename must run before docker.service"
+    has_dependency "$repo_root/$rename" Before "$setup"
+    check $? "$rename must run before $setup"
     has_dependency "$repo_root/$setup" After network.target
     check $? "$setup must retain After=network.target"
 done

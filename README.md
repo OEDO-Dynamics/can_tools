@@ -90,6 +90,13 @@ For full option details, see `/opt/can_tools/can_tools.conf.example`.
 
 ### Systemd Services
 
+Plus rename retains the original wiring: `spi1.1 → can0`, `spi1.2 → can1`
+(MCP2515/mcp251x); the shared FD `CAN_SPI_MAP` does not override these ports.
+Both rename units run before `docker.service`; an external device holding a
+Plus target name causes ERROR/exit 1 without changing interfaces. A failed
+Plus swap rolls names back best-effort and reports ERROR/exit 1; interfaces
+may remain down and require recovery while the machine is stopped.
+
 Each FD/Plus setup unit pulls in its matching rename unit and waits for it;
 with both unit files installed, rename does not need to be enabled separately.
 
